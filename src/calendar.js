@@ -639,6 +639,7 @@ class EnrollmentModal extends Modal {
     const open = el.createEl("button", { text: "Open enrollment page" });
     open.addEventListener("click", () => {
       const url = new URL(this.portal);
+      if (!url.pathname.endsWith("/")) url.pathname += "/";
       url.searchParams.set("code", this.pairing.pairingCode);
       window.open(url.toString(), "_blank");
     });
