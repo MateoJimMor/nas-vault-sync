@@ -625,6 +625,7 @@ class EnrollmentModal extends Modal {
     this.portal = portal;
     this.pairing = pairing;
     this.timer = null;
+    this.pollInFlight = false;
   }
 
   onOpen() {
@@ -642,6 +643,8 @@ class EnrollmentModal extends Modal {
       window.open(url.toString(), "_blank");
     });
     this.timer = window.setInterval(async () => {
+      if (this.pollInFlight) return;
+      this.pollInFlight = true;
       try {
         const value = await enrollmentRequest(this.portal, `/api/v1/pairing/poll?token=${encodeURIComponent(this.pairing.pollToken)}`);
         if (value.status === "complete") {
@@ -656,6 +659,8 @@ class EnrollmentModal extends Modal {
       } catch (error) {
         window.clearInterval(this.timer);
         status.setText(error.message || String(error));
+      } finally {
+        this.pollInFlight = false;
       }
     }, 2500);
   }
