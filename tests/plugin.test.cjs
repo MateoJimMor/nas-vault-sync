@@ -23,7 +23,7 @@ test("built plugin preserves calendar commands/settings and adds overview", asyn
   const plugin = new context.module.exports();
   await plugin.onload();
   assert.equal(plugin.settings.calendarId, "existing");
-  for (const command of ["open-calendar", "refresh-calendar", "create-calendar-event", "open-todays-daily-note", "open-nas-overview", "sync-vault-now"]) {
+  for (const command of ["open-calendar", "refresh-calendar", "create-calendar-event", "open-todays-daily-note", "open-nas-overview", "sync-vault-now", "test-vault-sync-connection"]) {
     assert.ok(plugin.commands.includes(command));
   }
 });

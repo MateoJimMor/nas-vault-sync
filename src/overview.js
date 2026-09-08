@@ -12,6 +12,7 @@ class NasOverview extends Modal {
     el.createEl("h3", { text: "Connection" });
     const status = el.createEl("p", { text: "Not checked in this session." });
     const readiness = connectionReadiness(this.plugin.settings.apiBaseUrl, this.plugin.getToken());
+    const syncReadiness = connectionReadiness(this.plugin.settings.syncApiBaseUrl, this.plugin.getSyncToken());
     const setup = readiness.api === "ready"
       ? "Private API address configured."
       : readiness.api === "missing"
@@ -27,6 +28,24 @@ class NasOverview extends Modal {
       try {
         const result = await this.plugin.health();
         status.setText(result.status === "ok" ? "Calendar API connected and authenticated." : "Server responded, but did not report healthy.");
+      } catch (error) { status.setText(error.message); }
+      finally { button.setDisabled(false); }
+    }));
+    const syncSetup = syncReadiness.api === "ready"
+      ? "Vault-sync address configured."
+      : syncReadiness.api === "missing"
+        ? "Vault-sync address is not configured."
+        : "Vault-sync address needs correction.";
+    const syncToken = syncReadiness.token === "present"
+      ? "Vault-sync device token is present locally."
+      : "Vault-sync device token is not configured on this device.";
+    el.createEl("p", { text: `${syncSetup} ${syncToken} No address or token is displayed here.` });
+    new Setting(el).setName("Vault Sync API").addButton(button => button.setButtonText("Check connection").onClick(async () => {
+      button.setDisabled(true);
+      status.setText("Checking vault sync…");
+      try {
+        const result = await this.plugin.syncHealth();
+        status.setText(result.status === "ok" ? "Vault Sync API connected and authenticated." : "Vault Sync API responded, but did not report healthy.");
       } catch (error) { status.setText(error.message); }
       finally { button.setDisabled(false); }
     }));

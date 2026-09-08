@@ -29,6 +29,7 @@ const DEFAULT_SETTINGS = {
   weekStartsMonday: true,
   syncApiBaseUrl: "",
   syncDeviceName: "",
+  enrollmentPortalUrl: "",
   automaticVaultSync: false,
 };
 
@@ -55,6 +56,7 @@ class NasCalendarBridge extends Plugin {
     });
     this.addCommand({ id: "initial-server-vault-sync", name: "Initial server-authoritative vault sync", callback: () => this.initialServerSync() });
     this.addCommand({ id: "sync-vault-now", name: "Sync vault now", callback: () => this.syncVaultNow() });
+    this.addCommand({ id: "test-vault-sync-connection", name: "Test vault-sync connection", callback: () => this.testSyncConnection() });
     this.addCommand({
       id: "refresh-calendar",
       name: "Refresh NAS calendar",
@@ -129,6 +131,40 @@ class NasCalendarBridge extends Plugin {
 
   async syncHealth() {
     return syncRequest(requestUrl, this.settings.syncApiBaseUrl, this.getSyncToken(), "/sync/v1/health");
+  }
+
+  async testSyncConnection() {
+    try {
+      const health = await this.syncHealth();
+      new Notice(`Vault sync healthy (contract v${health.apiVersion || "?"}).`);
+      return health;
+    } catch (error) {
+      new Notice(error.message || String(error));
+      throw error;
+    }
+  }
+
+  async connectViaEnrollment() {
+    const portal = this.settings.enrollmentPortalUrl.trim();
+    if (!portal) {
+      new Notice("Configure the private enrollment portal URL first.");
+      return;
+    }
+    if (!this.settings.syncDeviceName.trim()) {
+      new Notice("Choose this device's sync name first.");
+      return;
+    }
+    try {
+      const value = await enrollmentRequest(portal, "/api/v1/pairing/start", "POST", {
+        deviceName: this.settings.syncDeviceName.trim(),
+      });
+      if (!value || value.apiVersion !== API_VERSION || typeof value.pairingCode !== "string" || typeof value.pollToken !== "string") {
+        throw new Error("Enrollment portal returned an incompatible pairing response.");
+      }
+      new EnrollmentModal(this.app, this, portal, value).open();
+    } catch (error) {
+      new Notice(error.message || String(error));
+    }
   }
 
   async initialServerSync() {
@@ -525,9 +561,19 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
       .addText((text) => text.setPlaceholder("https://sync.example.com/vault-sync").setValue(this.plugin.settings.syncApiBaseUrl).onChange(async (value) => { this.plugin.settings.syncApiBaseUrl = value.trim(); await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
+      .setName("Private enrollment portal URL")
+      .setDesc("Optional: the private Tailscale address of the NAS pairing page. It never contains a permanent token.")
+      .addText((text) => text.setPlaceholder("https://nas.example/enroll").setValue(this.plugin.settings.enrollmentPortalUrl).onChange(async (value) => { this.plugin.settings.enrollmentPortalUrl = value.trim(); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
       .setName("This device's sync name")
       .setDesc("Used only in preserved conflict filenames.")
       .addText((text) => text.setPlaceholder("Phone").setValue(this.plugin.settings.syncDeviceName).onChange(async (value) => { this.plugin.settings.syncDeviceName = value.trim(); await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName("Connect to NAS")
+      .setDesc("Starts a short-lived pairing code. Approve it on the private enrollment page; the device token is stored locally only.")
+      .addButton((button) => button.setButtonText("Pair device").onClick(() => this.plugin.connectViaEnrollment()));
 
     new Setting(containerEl)
       .setName("Automatic vault sync")
@@ -554,7 +600,7 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
       .addText((text) => { text.inputEl.type = "password"; text.setPlaceholder("Device token").setValue(this.plugin.getSyncToken()); text.onChange((value) => this.plugin.setSyncToken(value.trim())); });
 
     new Setting(containerEl)
-      .setName("Test connection")
+      .setName("Test Calendar connection")
       .setDesc("Checks the authenticated health endpoint without changing calendar data.")
       .addButton((buttonEl) => buttonEl.setButtonText("Test").onClick(async () => {
         try {
@@ -564,7 +610,82 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
           new Notice(error.message || String(error));
         }
       }));
+
+    new Setting(containerEl)
+      .setName("Test Vault Sync connection")
+      .setDesc("Checks the authenticated vault-sync health endpoint without changing files.")
+      .addButton((buttonEl) => buttonEl.setButtonText("Test").onClick(() => this.plugin.testSyncConnection()));
   }
+}
+
+class EnrollmentModal extends Modal {
+  constructor(app, plugin, portal, pairing) {
+    super(app);
+    this.plugin = plugin;
+    this.portal = portal;
+    this.pairing = pairing;
+    this.timer = null;
+  }
+
+  onOpen() {
+    const el = this.contentEl;
+    el.empty();
+    el.createEl("h2", { text: "Connect this device to NAS" });
+    el.createEl("p", { text: "Approve this one-time code on the private enrollment page. No permanent credential is shown here." });
+    const code = el.createEl("code", { text: this.pairing.pairingCode });
+    code.setAttr("aria-label", "One-time pairing code");
+    const status = el.createEl("p", { text: "Waiting for approval…" });
+    const open = el.createEl("button", { text: "Open enrollment page" });
+    open.addEventListener("click", () => {
+      const url = new URL(this.portal);
+      url.searchParams.set("code", this.pairing.pairingCode);
+      window.open(url.toString(), "_blank");
+    });
+    this.timer = window.setInterval(async () => {
+      try {
+        const value = await enrollmentRequest(this.portal, `/api/v1/pairing/poll?token=${encodeURIComponent(this.pairing.pollToken)}`);
+        if (value.status === "complete") {
+          window.clearInterval(this.timer);
+          this.plugin.settings.syncApiBaseUrl = value.apiBaseUrl;
+          this.plugin.settings.syncDeviceName = value.deviceName;
+          this.plugin.setSyncToken(value.token);
+          await this.plugin.saveSettings();
+          status.setText("Device approved and configured. You can close this window.");
+          new Notice("NAS device pairing complete. Test the vault-sync connection before syncing.");
+        }
+      } catch (error) {
+        window.clearInterval(this.timer);
+        status.setText(error.message || String(error));
+      }
+    }, 2500);
+  }
+
+  onClose() {
+    if (this.timer) window.clearInterval(this.timer);
+    this.contentEl.empty();
+  }
+}
+
+async function enrollmentRequest(base, path, method = "GET", body = undefined) {
+  let url;
+  try {
+    const parsed = new URL(base.trim());
+    if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
+    url = base.trim().replace(/\/$/, "") + path;
+  } catch (_error) {
+    throw new Error("Configure a valid private enrollment portal URL.");
+  }
+  const response = await requestUrl({
+    url,
+    method,
+    headers: { Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    throw: false,
+  });
+  let value;
+  try { value = JSON.parse(response.text); } catch (_error) { throw new Error("Enrollment portal returned an invalid response."); }
+  if (response.status < 200 || response.status >= 300) throw new Error(value.message || `Enrollment failed (HTTP ${response.status}).`);
+  return value;
 }
 
 function textSetting(parent, name, placeholder, value) {
