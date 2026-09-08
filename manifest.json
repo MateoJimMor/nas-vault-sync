@@ -1,0 +1,9 @@
+{
+  "id": "nas-calendar-bridge",
+  "name": "NAS Vault",
+  "version": "0.5.1",
+  "minAppVersion": "1.3.0",
+  "description": "NAS overview, calendar, server-routed daily notes, and private vault-sync setup.",
+  "author": "Mateo",
+  "isDesktopOnly": false
+}

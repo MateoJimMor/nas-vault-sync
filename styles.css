@@ -1,0 +1,122 @@
+.nas-calendar-bridge {
+  height: 100%;
+  overflow: auto;
+  padding: 1rem;
+}
+
+.nas-calendar-bridge__toolbar,
+.nas-calendar-bridge__toolbar-group,
+.nas-calendar-bridge__event-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.nas-calendar-bridge__toolbar {
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.nas-calendar-bridge__month {
+  min-width: 11rem;
+  text-align: center;
+  font-weight: 600;
+}
+
+.nas-calendar-bridge__status {
+  min-height: 1.5rem;
+  margin-bottom: 0.75rem;
+  color: var(--text-muted);
+}
+
+.nas-calendar-bridge__status.is-error {
+  color: var(--text-error);
+}
+
+.nas-calendar-bridge__weekdays,
+.nas-calendar-bridge__grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(8rem, 1fr));
+  min-width: 56rem;
+}
+
+.nas-calendar-bridge__weekday {
+  padding: 0.5rem;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  text-align: center;
+}
+
+.nas-calendar-bridge__day {
+  min-height: 7rem;
+  padding: 0.4rem;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  text-align: left;
+  vertical-align: top;
+  cursor: pointer;
+}
+
+.nas-calendar-bridge__day:hover,
+.nas-calendar-bridge__day.is-selected {
+  background: var(--background-secondary);
+}
+
+.nas-calendar-bridge__day.is-outside-month {
+  color: var(--text-faint);
+}
+
+.nas-calendar-bridge__day.is-today .nas-calendar-bridge__day-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  min-height: 1.5rem;
+  border-radius: 50%;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.nas-calendar-bridge__day-number {
+  display: inline-block;
+  margin-bottom: 0.3rem;
+  font-weight: 600;
+}
+
+.nas-calendar-bridge__event {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  margin: 0.15rem 0;
+  padding: 0.15rem 0.3rem;
+  border: 0;
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: 3px;
+  background: var(--background-secondary-alt);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.nas-calendar-bridge__event:hover {
+  background: var(--background-modifier-hover);
+}
+
+.nas-calendar-bridge__event-time {
+  color: var(--text-muted);
+}
+
+.nas-calendar-bridge__empty {
+  padding: 2rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.nas-calendar-bridge__form-description {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}

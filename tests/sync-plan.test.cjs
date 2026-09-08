@@ -1,0 +1,4 @@
+const { test } = require("node:test"); const assert = require("node:assert/strict"); const { join } = require("node:path"); const { readFileSync } = require("node:fs"); const vm = require("node:vm");
+const esbuild = require("esbuild");
+const code = esbuild.transformSync(readFileSync(join(__dirname, "../src/sync-plan.ts"), "utf8"), { loader: "ts", format: "cjs" }).code; const context = { module: { exports: {} } }; vm.runInNewContext(code, context);
+test("three-way sync preserves concurrent edits", () => { const { resolveChange, conflictPath } = context.module.exports; assert.equal(resolveChange("unchanged", "modified"), "download"); assert.equal(resolveChange("modified", "unchanged"), "upload"); assert.equal(resolveChange("modified", "deleted"), "conflict"); assert.equal(conflictPath("a/note.md", "Phone 1", "2026-09-08T00:00:00Z"), "a/note.conflict-Phone-1-2026-09-08T000000Z.md"); });
