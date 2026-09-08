@@ -60,6 +60,42 @@ test("initial server-authoritative sync preserves local divergence without re-up
   assert.deepEqual(saved, { entries: [remote], revision: "server-revision" });
 });
 
+test("initial server-authoritative sync creates parent directories for downloaded files", async () => {
+  const files = new Map();
+  const directories = new Set();
+  const remote = { path: "server-seed/01-server-seed.md", sha256: createHash("sha256").update("server").digest("hex"), size: 6, modifiedAt: "2026-09-08T00:00:00Z" };
+  const require = name => ({
+    obsidian: { requestUrl: async () => ({}) },
+    "./sync-api": {
+      manifest: async () => ({ entries: [remote], revision: "server-revision" }),
+      pathUrl: path => path,
+      syncRequest: async () => ({ arrayBuffer: bytes("server") }),
+    },
+    "./scope": { classifyVaultPath: () => ({ scope: "shared" }) },
+    "./sync-plan": { conflictPath: path => `${path}.conflict` },
+    "./sync-reconcile": { reconcile: () => [] },
+    "./sync-state": { loadSyncState: () => undefined, saveSyncState: () => {}, loadPendingUpload: () => undefined, savePendingUpload: () => {}, clearPendingUpload: () => {} },
+  })[name];
+  const context = { module: { exports: {} }, require, crypto: webcrypto, Uint8Array, Array, Date, Error };
+  vm.runInNewContext(readFileSync(join(__dirname, "../src/sync-engine.js"), "utf8"), context);
+  const adapter = {
+    exists: async path => files.has(path) || directories.has(path),
+    mkdir: async path => directories.add(path),
+    readBinary: async path => files.get(path),
+    writeBinary: async (path, value) => files.set(path, value),
+    remove: async path => files.delete(path),
+  };
+  const plugin = {
+    settings: { syncApiBaseUrl: "http://private", syncDeviceName: "device" },
+    getSyncToken: () => "test-token",
+    app: { vault: { adapter, getFiles: () => [] } },
+  };
+  const result = await context.module.exports.initialServerSync(plugin);
+  assert.equal(result.downloaded, 1);
+  assert.deepEqual([...directories], ["server-seed"]);
+  assert.equal(text(files.get(remote.path)), "server");
+});
+
 test("normal sync resumes an interrupted chunk upload before committing", async () => {
   const sha256 = createHash("sha256").update("hello").digest("hex");
   const local = { path: "note.md", sha256, size: 5, modifiedAt: "2026-09-08T00:00:00Z" };

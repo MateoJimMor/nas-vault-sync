@@ -22,8 +22,19 @@ async function localManifest(plugin) {
   return entries.sort((left, right) => left.path.localeCompare(right.path));
 }
 
+async function ensureParentDirectory(plugin, path) {
+  const adapter = plugin.app.vault.adapter;
+  const parts = path.split("/").slice(0, -1);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!await adapter.exists(current)) await adapter.mkdir(current);
+  }
+}
+
 async function download(plugin, entry) {
   const condition = { "If-Match": `"${entry.sha256}"` };
+  await ensureParentDirectory(plugin, entry.path);
   if (entry.size === 0) {
     const response = await syncRequest(requestUrl, plugin.settings.syncApiBaseUrl, plugin.getSyncToken(), pathUrl(entry.path), "GET", undefined, condition);
     await plugin.app.vault.adapter.writeBinary(entry.path, response.arrayBuffer);
@@ -44,7 +55,9 @@ async function download(plugin, entry) {
 async function preserveLocalConflict(plugin, path) {
   const adapter = plugin.app.vault.adapter;
   if (!await adapter.exists(path)) return;
-  await adapter.writeBinary(conflictPath(path, plugin.settings.syncDeviceName || "device", new Date().toISOString()), await adapter.readBinary(path));
+  const conflict = conflictPath(path, plugin.settings.syncDeviceName || "device", new Date().toISOString());
+  await ensureParentDirectory(plugin, conflict);
+  await adapter.writeBinary(conflict, await adapter.readBinary(path));
 }
 
 function sameUpload(pending, local, remote) {
