@@ -15,6 +15,7 @@ const { requestApi } = require("./api");
 const { syncRequest } = require("./sync-api");
 const { initialServerSync } = require("./sync-engine");
 const { syncNow } = require("./sync-engine");
+const { loadSyncState } = require("./sync-state");
 const { NasOverview } = require("./overview");
 
 const VIEW_TYPE = "nas-calendar-bridge-view";
@@ -30,6 +31,8 @@ const DEFAULT_SETTINGS = {
   syncApiBaseUrl: "",
   syncDeviceName: "",
   enrollmentPortalUrl: "",
+  autoInitialSyncAfterPairing: true,
+  initialSyncCompleted: false,
   automaticVaultSync: false,
 };
 
@@ -167,13 +170,16 @@ class NasCalendarBridge extends Plugin {
     }
   }
 
-  async initialServerSync() {
+  async initialServerSync(options = {}) {
     if (this.vaultSyncRunning) return;
-    if (!window.confirm("Download the server vault now? Local files that differ will be preserved as conflict copies.")) return;
+    if (options.confirm !== false && !window.confirm("Download the server vault now? Local files that differ will be preserved as conflict copies.")) return;
     this.vaultSyncRunning = true;
     try {
       const result = await initialServerSync(this);
+      this.settings.initialSyncCompleted = true;
+      await this.saveSettings();
       new Notice(`Vault sync complete: ${result.downloaded} downloaded, ${result.conflicts} conflicts preserved.`);
+      return result;
     } catch (error) { new Notice(error.message || String(error)); }
     finally { this.vaultSyncRunning = false; }
   }
@@ -576,6 +582,11 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("Pair device").onClick(() => this.plugin.connectViaEnrollment()));
 
     new Setting(containerEl)
+      .setName("Initial sync after pairing")
+      .setDesc("Automatically downloads the server vault after a new device is approved. Local differences are preserved as conflict copies.")
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.autoInitialSyncAfterPairing !== false).onChange(async (value) => { this.plugin.settings.autoInitialSyncAfterPairing = value; await this.plugin.saveSettings(); }));
+
+    new Setting(containerEl)
       .setName("Automatic vault sync")
       .setDesc("Syncs while Obsidian is open after local changes. Enable only after Syncthing is stopped for this vault.")
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.automaticVaultSync).onChange(async (value) => { this.plugin.settings.automaticVaultSync = value; await this.plugin.saveSettings(); }));
@@ -654,8 +665,17 @@ class EnrollmentModal extends Modal {
           this.plugin.settings.syncDeviceName = value.deviceName;
           this.plugin.setSyncToken(value.token);
           await this.plugin.saveSettings();
-          status.setText("Device approved and configured. You can close this window.");
-          new Notice("NAS device pairing complete. Test the vault-sync connection before syncing.");
+          if (this.plugin.settings.autoInitialSyncAfterPairing !== false && !this.plugin.settings.initialSyncCompleted && !loadSyncState()) {
+            status.setText("Device approved. Starting the initial server sync…");
+            const result = await this.plugin.initialServerSync({ confirm: false });
+            if (result) {
+              status.setText(`Device approved and initial sync complete (${result.downloaded} downloaded, ${result.conflicts} conflicts preserved).`);
+              new Notice("NAS device pairing and initial vault sync complete.");
+            } else status.setText("Device approved, but the initial sync did not complete. Run the initial sync command to retry.");
+          } else {
+            status.setText("Device approved and configured. You can close this window.");
+            new Notice("NAS device pairing complete. The device token was stored locally.");
+          }
         }
       } catch (error) {
         window.clearInterval(this.timer);

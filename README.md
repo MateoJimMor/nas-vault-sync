@@ -16,6 +16,8 @@ and Android through a compatible private server API.
 - Uses conditional requests, resumable uploads, ranged downloads, and digest
   verification before replacing a downloaded file.
 - Keeps automatic foreground sync opt-in and off by default.
+- The private enrollment flow stores the device credential locally and can run
+  the server-authoritative initial sync automatically on first pairing.
 
 The plugin excludes Obsidian workspace/cache state, Git metadata, and generated
 conflict copies from synchronization. It does **not** promise unrestricted
@@ -30,7 +32,10 @@ server and a device-specific credential before sync can be configured.
 
 Do not use two synchronization engines as writers for the same vault. Test with
 a disposable vault and complete the server-authoritative initial sync before
-enabling ordinary two-way synchronization.
+enabling ordinary two-way synchronization. Pairing stores the device token in
+local plugin storage; it is not written into vault files. The initial sync runs
+once by default after a new pairing and preserves local differences as conflict
+copies. It can be disabled in the plugin settings.
 
 ## Development
 
