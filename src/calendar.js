@@ -34,6 +34,7 @@ const DEFAULT_SETTINGS = {
   autoInitialSyncAfterPairing: true,
   initialSyncCompleted: false,
   automaticVaultSync: false,
+  automaticVaultSyncIntervalSeconds: 30,
 };
 
 class CalendarApiError extends Error {
@@ -79,9 +80,12 @@ class NasCalendarBridge extends Plugin {
     this.addSettingTab(new CalendarBridgeSettingsTab(this.app, this));
     this.registerEvent(this.app.workspace.on("file-open", () => this.refreshViews()));
     for (const event of ["modify", "create", "delete", "rename"]) this.registerEvent(this.app.vault.on(event, () => this.scheduleVaultSync()));
+    this.startVaultSyncPolling();
   }
 
   onunload() {
+    this.stopVaultSyncPolling();
+    if (this.vaultSyncTimer) window.clearTimeout(this.vaultSyncTimer);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
   }
 
@@ -184,20 +188,35 @@ class NasCalendarBridge extends Plugin {
     finally { this.vaultSyncRunning = false; }
   }
 
-  async syncVaultNow() {
+  async syncVaultNow(options = {}) {
     if (this.vaultSyncRunning) return;
     this.vaultSyncRunning = true;
     try {
       const result = await syncNow(this);
-      new Notice(`Vault sync: ${result.downloaded} downloaded, ${result.uploaded} uploaded, ${result.deleted} deleted, ${result.conflicts} conflicts.`);
-    } catch (error) { new Notice(error.message || String(error)); }
+      if (!options.silent) new Notice(`Vault sync: ${result.downloaded} downloaded, ${result.uploaded} uploaded, ${result.deleted} deleted, ${result.conflicts} conflicts.`);
+      return result;
+    } catch (error) { if (!options.silent) new Notice(error.message || String(error)); }
     finally { this.vaultSyncRunning = false; }
   }
 
   scheduleVaultSync() {
-    if (!this.settings.automaticVaultSync || this.vaultSyncRunning) return;
+    if (!this.settings.automaticVaultSync || this.vaultSyncRunning || !loadSyncState()) return;
     window.clearTimeout(this.vaultSyncTimer);
     this.vaultSyncTimer = window.setTimeout(() => this.syncVaultNow(), 3000);
+  }
+
+  startVaultSyncPolling() {
+    this.stopVaultSyncPolling();
+    if (!this.settings.automaticVaultSync || typeof window === "undefined") return;
+    const seconds = Math.max(10, Math.min(3600, Number(this.settings.automaticVaultSyncIntervalSeconds) || 30));
+    this.vaultSyncPollTimer = window.setInterval(() => {
+      if (loadSyncState()) void this.syncVaultNow({ silent: true });
+    }, seconds * 1000);
+  }
+
+  stopVaultSyncPolling() {
+    if (this.vaultSyncPollTimer && typeof window !== "undefined") window.clearInterval(this.vaultSyncPollTimer);
+    this.vaultSyncPollTimer = undefined;
   }
 
   async ensureDailyNote(date) {
@@ -589,7 +608,12 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Automatic vault sync")
       .setDesc("Syncs while Obsidian is open after local changes. Enable only after Syncthing is stopped for this vault.")
-      .addToggle((toggle) => toggle.setValue(this.plugin.settings.automaticVaultSync).onChange(async (value) => { this.plugin.settings.automaticVaultSync = value; await this.plugin.saveSettings(); }));
+      .addToggle((toggle) => toggle.setValue(this.plugin.settings.automaticVaultSync).onChange(async (value) => { this.plugin.settings.automaticVaultSync = value; await this.plugin.saveSettings(); this.plugin.startVaultSyncPolling(); }));
+
+    new Setting(containerEl)
+      .setName("Automatic sync poll interval (seconds)")
+      .setDesc("Checks the NAS for remote changes while Obsidian is open. Minimum 10 seconds; mobile background execution is not guaranteed.")
+      .addText((text) => { text.inputEl.type = "number"; text.setValue(String(this.plugin.settings.automaticVaultSyncIntervalSeconds || 30)); text.onChange(async (value) => { const seconds = Math.max(10, Math.min(3600, Number(value) || 30)); this.plugin.settings.automaticVaultSyncIntervalSeconds = seconds; text.setValue(String(seconds)); await this.plugin.saveSettings(); this.plugin.startVaultSyncPolling(); }); });
 
     new Setting(containerEl)
       .setName("Sync vault now")
