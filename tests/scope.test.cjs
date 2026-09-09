@@ -21,7 +21,7 @@ test("keeps workspace and cache state device-local", () => {
 });
 
 test("requires review for application resources, conflicts, and unsafe paths", () => {
-  for (const path of [".obsidian/plugins/nas-calendar-bridge/data.json", ".git/index", "../outside.md", "/absolute.md", "folder\\file.md", "notes/a.conflict-phone-20260908T000000Z.md"])
+  for (const path of [".obsidian/plugins/mynasbridge/data.json", ".obsidian/plugins/nas-calendar-bridge/data.json", ".git/index", "../outside.md", "/absolute.md", "folder\\file.md", "notes/a.conflict-phone-20260908T000000Z.md"])
     assert.equal(classifyVaultPath(path).scope, "user-reviewed");
   assert.equal(scopeSummary().length, 3);
 });

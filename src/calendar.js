@@ -19,6 +19,9 @@ const { loadSyncState } = require("./sync-state");
 const { NasOverview } = require("./overview");
 
 const VIEW_TYPE = "nas-calendar-bridge-view";
+const LEGACY_PLUGIN_ID = "nas-calendar-bridge";
+// Keep these keys stable so changing the published plugin ID does not discard
+// existing device-local credentials.
 const TOKEN_STORAGE_KEY = "nas-calendar-bridge.api-token";
 const SYNC_TOKEN_STORAGE_KEY = "nas-calendar-bridge.sync-token";
 const API_VERSION = 1;
@@ -47,7 +50,10 @@ class CalendarApiError extends Error {
 
 class NasCalendarBridge extends Plugin {
   async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const currentData = await this.loadData();
+    const legacyData = currentData ? undefined : await loadLegacySettings(this.app);
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, currentData || legacyData || {});
+    if (!currentData && legacyData) await this.saveData(this.settings);
     this.registerView(VIEW_TYPE, (leaf) => new CalendarView(leaf, this));
 
     this.addRibbonIcon("server", "Open NAS overview", () => new NasOverview(this.app, this).open());
@@ -713,6 +719,19 @@ class EnrollmentModal extends Modal {
   onClose() {
     if (this.timer) window.clearInterval(this.timer);
     this.contentEl.empty();
+  }
+}
+
+async function loadLegacySettings(app) {
+  const adapter = app?.vault?.adapter;
+  if (!adapter || typeof adapter.read !== "function") return undefined;
+  try {
+    const configDir = app.vault.configDir || ".obsidian";
+    const path = normalizePath(configDir + "/plugins/" + LEGACY_PLUGIN_ID + "/data.json");
+    const value = JSON.parse(await adapter.read(path));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+  } catch (_error) {
+    return undefined;
   }
 }
 
