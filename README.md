@@ -8,8 +8,8 @@ server-routed daily-note workflow, and an optional private vault-sync client.
 
 ## Current release
 
-Version 0.6.1 is the first development release with unified NAS-base-URL
-configuration. The plugin requires a compatible
+Version 0.6.2 is a privacy-cleanup release built on the 0.6.1 unified
+NAS-base-URL architecture. The plugin requires a compatible
 self-hosted NAS API and private network; this repository contains the Obsidian
 client only. The server, enrollment service, VPN, and hosting infrastructure
 are separate components.
@@ -70,8 +70,8 @@ Requirements: Node.js 22 or later.
     npm test
     npm run build
 
-Edit files in src/. main.js is generated and excluded from Git; tagged
-releases build and attach the Obsidian runtime files automatically.
+Edit files in src/. main.js is generated and included in tagged releases; the
+release workflow also attaches the Obsidian runtime files automatically.
 
 The first mynasbridge launch migrates compatible settings from the former
 nas-calendar-bridge development installation when that legacy data is

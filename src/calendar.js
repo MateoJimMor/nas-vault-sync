@@ -31,7 +31,7 @@ const API_VERSION = 1;
 
 const DEFAULT_SETTINGS = {
   nasBaseUrl: "",
-  diaryRoot: "Mateos Vault/03_Diary",
+  diaryRoot: "Daily",
   weekStartsMonday: true,
   syncDeviceName: "",
   autoInitialSyncAfterPairing: true,
