@@ -96,6 +96,77 @@ test("initial server-authoritative sync creates parent directories for downloade
   assert.equal(text(files.get(remote.path)), "server");
 });
 
+test("initial local import uploads local-only files without falsely preserving them as conflicts", async () => {
+  const localOnly = bytes("");
+  const remoteSame = { path: "same.md", sha256: createHash("sha256").update("same").digest("hex"), size: 4, modifiedAt: "2026-09-08T00:00:00Z" };
+  const files = new Map([["same.md", bytes("same")], ["local-only.md", localOnly]]);
+  const uploaded = [];
+  let saved;
+  const require = name => ({
+    obsidian: { requestUrl: async () => ({}) },
+    "./sync-api": {
+      manifest: async () => ({ entries: [remoteSame], revision: "server-revision" }),
+      pathUrl: path => path,
+      startUpload: async (_requestUrl, _base, _token, value) => { uploaded.push(value); return { uploadId: "upload-id", offset: 0, size: value.size, chunkSize: 4 }; },
+      uploadStatus: async () => { throw new Error("not used"); },
+      uploadChunk: async () => { throw new Error("not used"); },
+      commitUpload: async () => {},
+    },
+    "./scope": { classifyVaultPath: () => ({ scope: "shared" }) },
+    "./sync-plan": { conflictPath: path => `${path}.conflict` },
+    "./sync-reconcile": { reconcile: () => [] },
+    "./sync-state": { loadSyncState: () => undefined, saveSyncState: (entries, revision) => { saved = { entries, revision }; }, loadPendingUpload: () => undefined, savePendingUpload: () => {}, clearPendingUpload: () => {} },
+  })[name];
+  const context = { module: { exports: {} }, require, crypto: webcrypto, Uint8Array, Array, Date, Error };
+  vm.runInNewContext(readFileSync(join(__dirname, "../src/sync-engine.js"), "utf8"), context);
+  const plugin = {
+    settings: { syncApiBaseUrl: "http://private", syncDeviceName: "device" }, getSyncToken: () => "test-token",
+    app: { vault: { adapter: { exists: async path => files.has(path), readBinary: async path => files.get(path), writeBinary: async (path, value) => files.set(path, value), remove: async path => files.delete(path) }, getFiles: () => [...files].map(([path]) => ({ path, stat: { mtime: 0 } })) } },
+  };
+  const result = await context.module.exports.initialLocalImport(plugin);
+  assert.deepEqual({ ...result }, { downloaded: 0, uploaded: 1, deleted: 0, conflicts: 0, skipped: 0 });
+  assert.deepEqual(uploaded.map(value => ({ ...value })), [{ path: "local-only.md", size: 0, sha256: createHash("sha256").update("").digest("hex"), ifNoneMatch: true }]);
+  assert.equal(files.has("local-only.md.conflict"), false);
+  assert.deepEqual(saved, { entries: [remoteSame], revision: "server-revision" });
+});
+
+test("recovery only restores a protected setup copy when its original is absent locally and remotely", async () => {
+  const conflict = "folder/note.conflict-device-2026-09-10T191544202Z.md";
+  const original = "folder/note.md";
+  const files = new Map([[conflict, bytes("")]]);
+  const directories = new Set();
+  const uploaded = [], recovered = [];
+  let manifestCalls = 0, saved;
+  const require = name => ({
+    obsidian: { requestUrl: async () => ({}) },
+    "./sync-api": {
+      manifest: async () => (++manifestCalls === 1 ? { entries: [], revision: "before" } : { entries: [], revision: "after" }),
+      pathUrl: path => path,
+      startUpload: async (_requestUrl, _base, _token, value) => { uploaded.push(value); return { uploadId: "upload-id", offset: 0, size: 0, chunkSize: 4 }; },
+      uploadStatus: async () => { throw new Error("not used"); }, uploadChunk: async () => { throw new Error("not used"); }, commitUpload: async () => {},
+    },
+    "./scope": { classifyVaultPath: () => ({ scope: "shared" }) },
+    "./sync-plan": { conflictPath: path => `${path}.conflict`, sourcePathForConflictCopy: path => path === conflict ? original : undefined },
+    "./sync-reconcile": { reconcile: () => [] },
+    "./sync-state": { loadSyncState: () => undefined, saveSyncState: (entries, revision) => { saved = { entries, revision }; }, loadPendingUpload: () => undefined, savePendingUpload: () => {}, clearPendingUpload: () => {}, markSetupCopyRecovered: path => recovered.push(path) },
+  })[name];
+  const context = { module: { exports: {} }, require, crypto: webcrypto, Uint8Array, Array, Date, Error, Set };
+  vm.runInNewContext(readFileSync(join(__dirname, "../src/sync-engine.js"), "utf8"), context);
+  const plugin = {
+    settings: { syncApiBaseUrl: "http://private", syncDeviceName: "device" }, getSyncToken: () => "test-token",
+    app: { vault: { adapter: { exists: async path => files.has(path) || directories.has(path), mkdir: async path => directories.add(path), readBinary: async path => files.get(path), writeBinary: async (path, value) => files.set(path, value) }, getFiles: () => [...files].map(([path]) => ({ path, stat: { mtime: 0 } })) } },
+  };
+  const candidates = await context.module.exports.recoverableSetupCopies(plugin);
+  assert.deepEqual([...candidates].map(copy => ({ ...copy })), [{ conflictPath: conflict, originalPath: original }]);
+  const result = await context.module.exports.recoverSetupCopies(plugin, candidates);
+  assert.deepEqual({ ...result }, { restored: 1, uploaded: 1, skipped: 0 });
+  assert.equal(files.has(conflict), true);
+  assert.equal(files.has(original), true);
+  assert.deepEqual(uploaded.map(value => ({ ...value })), [{ path: original, size: 0, sha256: createHash("sha256").update("").digest("hex"), ifNoneMatch: true }]);
+  assert.deepEqual(recovered, [conflict]);
+  assert.deepEqual(saved, { entries: [], revision: "after" });
+});
+
 test("normal sync resumes an interrupted chunk upload before committing", async () => {
   const sha256 = createHash("sha256").update("hello").digest("hex");
   const local = { path: "note.md", sha256, size: 5, modifiedAt: "2026-09-08T00:00:00Z" };

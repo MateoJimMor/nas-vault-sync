@@ -20,7 +20,7 @@ test("invalid endpoint and missing token never reach transport", async () => {
   const transport = () => { throw new Error("must not be called"); };
   await assert.rejects(requestApi(transport, "file:///tmp", "x", "/v1/health"), /HTTP/);
   await assert.rejects(requestApi(transport, "https://user:secret@example.com", "x", "/v1/health"), /credentials/);
-  await assert.rejects(requestApi(transport, base, "", "/v1/health"), /token/);
+  await assert.rejects(requestApi(transport, base, "", "/v1/health"), /Connect this device/);
 });
 test("errors are redacted and mutations are not retried", async () => {
   let calls = 0;

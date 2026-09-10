@@ -1,11 +1,11 @@
 {
   "name": "nas-vault-sync",
-  "version": "0.5.1",
+  "version": "0.6.1",
   "private": true,
   "license": "GPL-3.0-or-later",
   "scripts": {
     "build": "node build.mjs",
-    "test": "npm run build && node tests/api.test.cjs && node tests/scope.test.cjs && node tests/connection.test.cjs && node tests/sync-status.test.cjs && node tests/sync-plan.test.cjs && node tests/sync-reconcile.test.cjs && node tests/sync-api.test.cjs && node tests/sync-engine.test.cjs && node tests/plugin.test.cjs"
+    "test": "npm run build && node tests/api.test.cjs && node tests/scope.test.cjs && node tests/connection.test.cjs && node tests/service-url.test.cjs && node tests/sync-status.test.cjs && node tests/sync-plan.test.cjs && node tests/sync-reconcile.test.cjs && node tests/sync-api.test.cjs && node tests/sync-engine.test.cjs && node tests/plugin.test.cjs"
   },
   "devDependencies": {
     "esbuild": "0.25.5",

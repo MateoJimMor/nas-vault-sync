@@ -15,3 +15,9 @@ export function conflictPath(path: string, device: string, timestamp: string): s
   const dot = path.lastIndexOf(".");
   return dot > 0 ? `${path.slice(0, dot)}.conflict-${name}-${time}${path.slice(dot)}` : `${path}.conflict-${name}-${time}`;
 }
+
+/** Returns the original path only for filenames created by conflictPath. */
+export function sourcePathForConflictCopy(path: string): string | undefined {
+  const match = /^(.*)\.conflict-[a-z0-9-]+-\d{4}-\d{2}-\d{2}T\d{6,}Z(\.[^/]+)?$/i.exec(path);
+  return match ? `${match[1]}${match[2] || ""}` : undefined;
+}

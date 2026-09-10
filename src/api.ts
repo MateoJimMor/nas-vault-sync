@@ -9,7 +9,7 @@ export async function requestApi(transport: Transport, base: string, token: stri
     throw new Error("Use an HTTP or HTTPS API URL without credentials, query, or fragment.");
   }
   if (!path.startsWith("/v1/") || path.includes("..")) throw new Error("Invalid API path.");
-  if (!token) throw new Error("Configure this device's API token in plugin settings.");
+  if (!token) throw new Error("Connect this device to NAS first.");
   const headers: Record<string, string> = { Accept: "application/json", Authorization: `Bearer ${token}` };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   let response: Response;

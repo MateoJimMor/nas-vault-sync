@@ -12,28 +12,28 @@ const {
 } = require("obsidian");
 
 const { requestApi } = require("./api");
-const { syncRequest } = require("./sync-api");
-const { initialServerSync } = require("./sync-engine");
+const { syncRequest, exportAccount, importAccount, history, trash, revisionContent, restoreRevision } = require("./sync-api");
+const { initialServerSync, initialLocalImport, recoverSetupCopies, renameNow, resolveConflict } = require("./sync-engine");
 const { syncNow } = require("./sync-engine");
 const { loadSyncState } = require("./sync-state");
-const { NasOverview } = require("./overview");
+const { NasControlCenterView, CONTROL_CENTER_VIEW_TYPE } = require("./overview");
+const { migrateNasBaseUrl, serviceBaseUrl } = require("./service-url");
 
 const VIEW_TYPE = "nas-calendar-bridge-view";
 const LEGACY_PLUGIN_ID = "nas-calendar-bridge";
-// Keep these keys stable so changing the published plugin ID does not discard
-// existing device-local credentials.
-const TOKEN_STORAGE_KEY = "nas-calendar-bridge.api-token";
-const SYNC_TOKEN_STORAGE_KEY = "nas-calendar-bridge.sync-token";
+// Legacy keys are read only during an explicit settings migration. New state is
+// scoped to a local vault installation so two vaults on one desktop cannot
+// overwrite each other's credentials or reconciliation state.
+const LEGACY_TOKEN_STORAGE_KEY = "nas-calendar-bridge.api-token";
+const LEGACY_SYNC_TOKEN_STORAGE_KEY = "nas-calendar-bridge.sync-token";
+const DEVICE_CREDENTIAL_KEY = "mynasbridge.device-credential.v2";
 const API_VERSION = 1;
 
 const DEFAULT_SETTINGS = {
-  apiBaseUrl: "",
-  calendarId: "personal",
-  diaryRoot: "Daily",
+  nasBaseUrl: "",
+  diaryRoot: "Mateos Vault/03_Diary",
   weekStartsMonday: true,
-  syncApiBaseUrl: "",
   syncDeviceName: "",
-  enrollmentPortalUrl: "",
   autoInitialSyncAfterPairing: true,
   initialSyncCompleted: false,
   automaticVaultSync: false,
@@ -52,19 +52,24 @@ class NasCalendarBridge extends Plugin {
   async onload() {
     const currentData = await this.loadData();
     const legacyData = currentData ? undefined : await loadLegacySettings(this.app);
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, currentData || legacyData || {});
-    if (!currentData && legacyData) await this.saveData(this.settings);
+    const sourceData = currentData || legacyData || {};
+    this.settings = migrateSettings(sourceData);
+    this.localScope = localVaultScope(this.app);
+    const hasLegacyUrl = ["apiBaseUrl", "syncApiBaseUrl", "enrollmentPortalUrl"]
+      .some((key) => Object.prototype.hasOwnProperty.call(sourceData, key));
+    if (!currentData || hasLegacyUrl || this.settings.nasBaseUrl !== sourceData.nasBaseUrl) await this.saveData(this.settings);
     this.registerView(VIEW_TYPE, (leaf) => new CalendarView(leaf, this));
+    this.registerView(CONTROL_CENTER_VIEW_TYPE, (leaf) => new NasControlCenterView(leaf, this));
 
-    this.addRibbonIcon("server", "Open NAS overview", () => new NasOverview(this.app, this).open());
-    this.addCommand({ id: "open-nas-overview", name: "Open NAS overview", callback: () => new NasOverview(this.app, this).open() });
-    this.addRibbonIcon("calendar-days", "Open NAS calendar", () => this.openCalendar());
+    this.addRibbonIcon("server", "Open NAS Vault", () => this.openNasControlCenter());
+    this.addCommand({ id: "open-nas-overview", name: "Open NAS Vault", callback: () => this.openNasControlCenter() });
     this.addCommand({
       id: "open-calendar",
       name: "Open calendar",
       callback: () => this.openCalendar(),
     });
     this.addCommand({ id: "initial-server-vault-sync", name: "Initial server-authoritative vault sync", callback: () => this.initialServerSync() });
+    this.addCommand({ id: "initial-local-vault-import", name: "Initial local vault import", callback: () => this.initialLocalImport() });
     this.addCommand({ id: "sync-vault-now", name: "Sync vault now", callback: () => this.syncVaultNow() });
     this.addCommand({ id: "test-vault-sync-connection", name: "Test vault-sync connection", callback: () => this.testSyncConnection() });
     this.addCommand({
@@ -85,7 +90,15 @@ class NasCalendarBridge extends Plugin {
 
     this.addSettingTab(new CalendarBridgeSettingsTab(this.app, this));
     this.registerEvent(this.app.workspace.on("file-open", () => this.refreshViews()));
-    for (const event of ["modify", "create", "delete", "rename"]) this.registerEvent(this.app.vault.on(event, () => this.scheduleVaultSync()));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      void (async () => { const handled = await renameNow(this, oldPath, file.path).catch(() => false); if (!handled) this.scheduleVaultSync(); })();
+    }));
+    for (const event of ["modify", "create", "delete"]) this.registerEvent(this.app.vault.on(event, () => this.scheduleVaultSync()));
+    if (typeof window !== "undefined" && typeof this.registerDomEvent === "function") {
+      this.registerDomEvent(window, "focus", () => void this.syncOnResume());
+      this.registerDomEvent(document, "visibilitychange", () => { if (!document.hidden) void this.syncOnResume(); });
+      window.setTimeout(() => void this.syncOnResume(), 1200);
+    }
     this.startVaultSyncPolling();
   }
 
@@ -93,6 +106,7 @@ class NasCalendarBridge extends Plugin {
     this.stopVaultSyncPolling();
     if (this.vaultSyncTimer) window.clearTimeout(this.vaultSyncTimer);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE);
+    this.app.workspace.detachLeavesOfType(CONTROL_CENTER_VIEW_TYPE);
   }
 
   async saveSettings() {
@@ -100,37 +114,31 @@ class NasCalendarBridge extends Plugin {
     await this.refreshViews();
   }
 
-  getToken() {
-    try {
-      return window.localStorage.getItem(TOKEN_STORAGE_KEY) || "";
-    } catch (_error) {
-      return "";
-    }
+  credentialStorageKey() { return `${DEVICE_CREDENTIAL_KEY}.${this.localScope}`; }
+  syncStateScope() {
+    const credential = this.getDeviceCredential();
+    return credential ? `${this.localScope}.${localStateHash(credential)}` : this.localScope;
   }
-
-  setToken(token) {
+  syncBaseUrl() { return serviceBaseUrl(this.settings.nasBaseUrl, "sync"); }
+  getDeviceCredential() { try { return window.localStorage.getItem(this.credentialStorageKey()) || ""; } catch (_error) { return ""; } }
+  setDeviceCredential(token) {
     try {
-      if (token) window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
-      else window.localStorage.removeItem(TOKEN_STORAGE_KEY);
-    } catch (_error) {
-      new Notice("Could not access local token storage.");
-    }
+      if (token) window.localStorage.setItem(this.credentialStorageKey(), token);
+      else window.localStorage.removeItem(this.credentialStorageKey());
+    } catch (_error) { new Notice("Could not access this device's local credential storage."); }
   }
-
-  getSyncToken() { try { return window.localStorage.getItem(SYNC_TOKEN_STORAGE_KEY) || ""; } catch (_error) { return ""; } }
-  setSyncToken(token) { try { if (token) window.localStorage.setItem(SYNC_TOKEN_STORAGE_KEY, token); else window.localStorage.removeItem(SYNC_TOKEN_STORAGE_KEY); } catch (_error) { new Notice("Could not access local token storage."); } }
+  // Compatibility aliases for the existing modules while all new flows use one grant.
+  getToken() { return this.getDeviceCredential(); }
+  getSyncToken() { return this.getDeviceCredential(); }
+  setToken(token) { this.setDeviceCredential(token); }
+  setSyncToken(token) { this.setDeviceCredential(token); }
 
   async apiRequest(path, method = "GET", body = undefined) {
-    return requestApi(requestUrl, this.settings.apiBaseUrl, this.getToken(), path, method, body);
+    return requestApi(requestUrl, serviceBaseUrl(this.settings.nasBaseUrl, "calendar"), this.getToken(), path, method, body);
   }
 
   async getEvents(start, end) {
-    const query = new URLSearchParams({
-      apiVersion: String(API_VERSION),
-      calendarId: this.settings.calendarId,
-      start,
-      end,
-    });
+    const query = new URLSearchParams({ apiVersion: String(API_VERSION), start, end });
     const data = await this.apiRequest(`/v1/events?${query.toString()}`);
     if (!data || data.apiVersion !== API_VERSION || !Array.isArray(data.events)) {
       throw new CalendarApiError("Calendar API returned an unsupported response.");
@@ -143,7 +151,56 @@ class NasCalendarBridge extends Plugin {
   }
 
   async syncHealth() {
-    return syncRequest(requestUrl, this.settings.syncApiBaseUrl, this.getSyncToken(), "/sync/v1/health");
+    const response = await syncRequest(requestUrl, this.syncBaseUrl(), this.getDeviceCredential(), "/sync/v1/health");
+    try { return JSON.parse(response.text); }
+    catch (_error) { throw new Error("Vault sync health returned an invalid response."); }
+  }
+
+  async checkNasConnection(options = {}) {
+    const [calendar, sync, heartbeat] = await Promise.allSettled([this.health(), this.syncHealth(), this.touchDevice()]);
+    const result = {
+      calendar: calendar.status === "fulfilled" && calendar.value?.status === "ok",
+      sync: sync.status === "fulfilled" && sync.value?.status === "ok",
+      device: heartbeat.status === "fulfilled" && heartbeat.value?.status === "ok",
+    };
+    if (!options.silent) new Notice(`NAS connection: calendar ${result.calendar ? "connected" : "unavailable"}; vault sync ${result.sync ? "connected" : "unavailable"}.`);
+    return result;
+  }
+
+  async touchDevice() {
+    return enrollmentRequest(serviceBaseUrl(this.settings.nasBaseUrl, "enrollment"), "/api/v2/device/heartbeat", "POST", {}, this.getDeviceCredential());
+  }
+
+  async activeDevices() {
+    return enrollmentRequest(serviceBaseUrl(this.settings.nasBaseUrl, "enrollment"), "/api/v2/device/list-active", "POST", {}, this.getDeviceCredential());
+  }
+
+  async accountSummary() {
+    return enrollmentRequest(serviceBaseUrl(this.settings.nasBaseUrl, "enrollment"), "/api/v2/account/me", "POST", {}, this.getDeviceCredential());
+  }
+
+  async renameThisDevice(name) {
+    const result = await enrollmentRequest(serviceBaseUrl(this.settings.nasBaseUrl, "enrollment"), "/api/v2/device/rename-active", "POST", { deviceName: name }, this.getDeviceCredential());
+    this.settings.syncDeviceName = result.deviceName;
+    await this.saveSettings();
+    return result;
+  }
+
+  async disconnectThisDevice() {
+    this.setDeviceCredential("");
+    this.settings.initialSyncCompleted = false;
+    await this.saveSettings();
+  }
+
+  async openNasControlCenter() {
+    let leaf = this.app.workspace.getLeavesOfType(CONTROL_CENTER_VIEW_TYPE)[0];
+    if (!leaf) leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: CONTROL_CENTER_VIEW_TYPE, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  async revokeActiveDevice(name) {
+    return enrollmentRequest(serviceBaseUrl(this.settings.nasBaseUrl, "enrollment"), "/api/v2/device/revoke-active", "POST", { deviceName: name }, this.getDeviceCredential());
   }
 
   async testSyncConnection() {
@@ -157,10 +214,38 @@ class NasCalendarBridge extends Plugin {
     }
   }
 
-  async connectViaEnrollment() {
-    const portal = this.settings.enrollmentPortalUrl.trim();
-    if (!portal) {
-      new Notice("Configure the private enrollment portal URL first.");
+  async exportAccountArchive() {
+    const bytes = await exportAccount(requestUrl, this.syncBaseUrl(), this.getDeviceCredential());
+    const path = `.nas-vault-sync/account-export-${new Date().toISOString().replace(/[:.]/g, "-")}.zip`;
+    await this.app.vault.adapter.mkdir(".nas-vault-sync").catch(() => undefined);
+    await this.app.vault.adapter.writeBinary(path, bytes);
+    new Notice(`Account export saved to ${path}. Keep it private.`);
+    return path;
+  }
+
+  async importAccountArchive(file, dryRun = false) {
+    const bytes = await file.arrayBuffer();
+    const result = await importAccount(requestUrl, this.syncBaseUrl(), this.getDeviceCredential(), bytes, dryRun);
+    return result;
+  }
+
+  async accountHistory(path) { return history(requestUrl, this.syncBaseUrl(), this.getDeviceCredential(), path); }
+  async accountTrash() { return trash(requestUrl, this.syncBaseUrl(), this.getDeviceCredential()); }
+  async restoreDeletedRevision(revision) { return restoreRevision(requestUrl, this.syncBaseUrl(), this.getDeviceCredential(), revision); }
+  async revisionBytes(revision) { return revisionContent(requestUrl, this.syncBaseUrl(), this.getDeviceCredential(), revision); }
+  async resolveConflict(issue, choice) {
+    const result = await resolveConflict(this, issue, choice);
+    const { loadSyncIssues, saveSyncIssues } = require("./sync-state");
+    saveSyncIssues(loadSyncIssues(this.syncStateScope()).map(item => item.id === issue.id ? { ...item, reviewed: true } : item), this.syncStateScope());
+    return result;
+  }
+
+  async connectViaMultiUserEnrollment() {
+    let portal;
+    try {
+      portal = serviceBaseUrl(this.settings.nasBaseUrl, "enrollment");
+    } catch (_error) {
+      new Notice("Configure the private NAS base URL first.");
       return;
     }
     if (!this.settings.syncDeviceName.trim()) {
@@ -168,13 +253,11 @@ class NasCalendarBridge extends Plugin {
       return;
     }
     try {
-      const value = await enrollmentRequest(portal, "/api/v1/pairing/start", "POST", {
-        deviceName: this.settings.syncDeviceName.trim(),
-      });
-      if (!value || value.apiVersion !== API_VERSION || typeof value.pairingCode !== "string" || typeof value.pollToken !== "string") {
-        throw new Error("Enrollment portal returned an incompatible pairing response.");
+      const pairing = await enrollmentRequest(portal, "/api/v2/pairing/start", "POST", { deviceName: this.settings.syncDeviceName.trim() });
+      if (pairing.apiVersion !== 2 || typeof pairing.pairingCode !== "string" || typeof pairing.pollToken !== "string") {
+        throw new Error("Enrollment portal returned an incompatible response.");
       }
-      new EnrollmentModal(this.app, this, portal, value).open();
+      new PortalEnrollmentModal(this.app, this, portal, pairing).open();
     } catch (error) {
       new Notice(error.message || String(error));
     }
@@ -194,6 +277,37 @@ class NasCalendarBridge extends Plugin {
     finally { this.vaultSyncRunning = false; }
   }
 
+  async initialLocalImport() {
+    if (this.vaultSyncRunning) return;
+    this.vaultSyncRunning = true;
+    try {
+      const result = await initialLocalImport(this);
+      this.settings.initialSyncCompleted = true;
+      await this.saveSettings();
+      new Notice(`Local vault imported: ${result.uploaded} uploaded, ${result.conflicts} existing server files preserved.`);
+      return result;
+    } catch (error) { new Notice(error.message || String(error)); }
+    finally { this.vaultSyncRunning = false; }
+  }
+
+  async recoverSetupCopies(copies) {
+    if (this.vaultSyncRunning) return;
+    this.vaultSyncRunning = true;
+    try {
+      const result = await recoverSetupCopies(this, copies);
+      this.settings.initialSyncCompleted = true;
+      await this.saveSettings();
+      new Notice(`Recovered ${result.restored} protected setup ${result.restored === 1 ? "copy" : "copies"} into this account. The protected copies remain for verification.`);
+      return result;
+    } catch (error) { new Notice(error.message || String(error)); }
+    finally { this.vaultSyncRunning = false; }
+  }
+
+  async chooseInitialSync() {
+    const importLocal = window.confirm("This is the first sync for this device. Press OK to import this device's shared vault into the new server account. Press Cancel to start from the server vault instead.");
+    return importLocal ? this.initialLocalImport() : this.initialServerSync({ confirm: false });
+  }
+
   async syncVaultNow(options = {}) {
     if (this.vaultSyncRunning) return;
     this.vaultSyncRunning = true;
@@ -205,10 +319,16 @@ class NasCalendarBridge extends Plugin {
     finally { this.vaultSyncRunning = false; }
   }
 
+  async syncOnResume() {
+    if (!this.settings.nasBaseUrl || !this.getDeviceCredential()) return;
+    await this.checkNasConnection({ silent: true });
+    if (this.settings.automaticVaultSync && loadSyncState(this.syncStateScope())) await this.syncVaultNow({ silent: true });
+  }
+
   scheduleVaultSync() {
-    if (!this.settings.automaticVaultSync || this.vaultSyncRunning || !loadSyncState()) return;
+    if (!this.settings.automaticVaultSync || this.vaultSyncRunning || !loadSyncState(this.syncStateScope())) return;
     window.clearTimeout(this.vaultSyncTimer);
-    this.vaultSyncTimer = window.setTimeout(() => this.syncVaultNow(), 3000);
+    this.vaultSyncTimer = window.setTimeout(() => this.syncVaultNow({ silent: true }), 3000);
   }
 
   startVaultSyncPolling() {
@@ -216,7 +336,7 @@ class NasCalendarBridge extends Plugin {
     if (!this.settings.automaticVaultSync || typeof window === "undefined") return;
     const seconds = Math.max(10, Math.min(3600, Number(this.settings.automaticVaultSyncIntervalSeconds) || 30));
     this.vaultSyncPollTimer = window.setInterval(() => {
-      if (loadSyncState()) void this.syncVaultNow({ silent: true });
+      if (loadSyncState(this.syncStateScope())) void this.syncVaultNow({ silent: true });
     }, seconds * 1000);
   }
 
@@ -235,7 +355,6 @@ class NasCalendarBridge extends Plugin {
   async createEvent(event) {
     const data = await this.apiRequest("/v1/events", "POST", {
       apiVersion: API_VERSION,
-      calendarId: this.settings.calendarId,
       event,
     });
     return data.event;
@@ -244,7 +363,6 @@ class NasCalendarBridge extends Plugin {
   async updateEvent(id, event) {
     const data = await this.apiRequest(`/v1/events/${encodeURIComponent(id)}`, "PUT", {
       apiVersion: API_VERSION,
-      calendarId: this.settings.calendarId,
       event,
     });
     return data.event;
@@ -253,7 +371,6 @@ class NasCalendarBridge extends Plugin {
   async deleteEvent(id) {
     return this.apiRequest(`/v1/events/${encodeURIComponent(id)}`, "DELETE", {
       apiVersion: API_VERSION,
-      calendarId: this.settings.calendarId,
     });
   }
 
@@ -451,6 +568,7 @@ class EventModal extends Modal {
     fields.startTime = textSetting(contentEl, "Start time", "HH:MM", start.time);
     fields.endDate = textSetting(contentEl, "End date", "YYYY-MM-DD", end.date);
     fields.endTime = textSetting(contentEl, "End time", "HH:MM", end.time);
+    fields.topic = textSetting(contentEl, "Topic", "Optional category", this.event?.topic || "");
     fields.color = textSetting(contentEl, "Color", "#7c3aed", this.event?.color || "#7c3aed");
     fields.location = textSetting(contentEl, "Location", "Optional", this.event?.location || "");
     fields.url = textSetting(contentEl, "Link", "https://…", this.event?.url || "");
@@ -511,6 +629,7 @@ class EventModal extends Modal {
         allDay,
         start: allDay ? startDate : `${startDate}T${startTime}`,
         end: allDay ? endDate : `${endDate}T${endTime}`,
+        topic: fields.topic.value.trim(),
         color: fields.color.value.trim() || "#7c3aed",
         location: fields.location.value.trim(),
         url: fields.url.value.trim(),
@@ -541,29 +660,19 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "NAS Vault — Calendar settings" });
+    containerEl.createEl("h2", { text: "NAS Vault settings" });
     containerEl.createEl("p", {
-      text: "The API URL points to your self-hosted bridge. It must expose this plugin's compatible API contract.",
+      text: "Use one private NAS base URL. Calendar, vault sync, and enrollment are routed internally by the NAS gateway.",
     });
 
     new Setting(containerEl)
-      .setName("Calendar API URL")
-      .setDesc("Use the private address of your compatible calendar service.")
+      .setName("NAS base URL")
+      .setDesc("Use the private Tailscale address of the NAS, without a service path, credentials, query, or fragment.")
       .addText((text) => text
-        .setPlaceholder("https://…")
-        .setValue(this.plugin.settings.apiBaseUrl)
+        .setPlaceholder("https://nas.example")
+        .setValue(this.plugin.settings.nasBaseUrl)
         .onChange(async (value) => {
-          this.plugin.settings.apiBaseUrl = value.trim();
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(containerEl)
-      .setName("Calendar ID")
-      .setDesc("The canonical calendar identifier on the NAS backend.")
-      .addText((text) => text
-        .setValue(this.plugin.settings.calendarId)
-        .onChange(async (value) => {
-          this.plugin.settings.calendarId = value.trim() || DEFAULT_SETTINGS.calendarId;
+          this.plugin.settings.nasBaseUrl = migrateNasBaseUrl(value);
           await this.plugin.saveSettings();
         }));
 
@@ -587,33 +696,28 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName("Vault Sync API URL")
-      .setDesc("Use the private address of your compatible sync service. Complete the initial sync before ordinary synchronization.")
-      .addText((text) => text.setPlaceholder("https://sync.example.com/vault-sync").setValue(this.plugin.settings.syncApiBaseUrl).onChange(async (value) => { this.plugin.settings.syncApiBaseUrl = value.trim(); await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl)
-      .setName("Private enrollment portal URL")
-      .setDesc("Optional: the private Tailscale address of the NAS pairing page. It never contains a permanent token.")
-      .addText((text) => text.setPlaceholder("https://nas.example/enroll").setValue(this.plugin.settings.enrollmentPortalUrl).onChange(async (value) => { this.plugin.settings.enrollmentPortalUrl = value.trim(); await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl)
-      .setName("This device's sync name")
-      .setDesc("Used only in preserved conflict filenames.")
+      .setName("Device name")
+      .setDesc("Shown only to this account. Active device names must be unique within the account.")
       .addText((text) => text.setPlaceholder("Phone").setValue(this.plugin.settings.syncDeviceName).onChange(async (value) => { this.plugin.settings.syncDeviceName = value.trim(); await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Connect to NAS")
-      .setDesc("Starts a short-lived pairing code. Approve it on the private enrollment page; the device token is stored locally only.")
-      .addButton((button) => button.setButtonText("Pair device").onClick(() => this.plugin.connectViaEnrollment()));
+      .setDesc("Register a new account or sign in and connect this device. The NAS stores its credential locally.")
+      .addButton((button) => button.setButtonText("Connect to NAS").onClick(() => this.plugin.connectViaMultiUserEnrollment()));
 
     new Setting(containerEl)
-      .setName("Initial sync after pairing")
-      .setDesc("Automatically downloads the server vault after a new device is approved. Local differences are preserved as conflict copies.")
+      .setName("Your active devices")
+      .setDesc("Shows devices currently authorized for this account. Devices unseen for 30 days are removed automatically.")
+      .addButton((button) => button.setButtonText("Manage devices").onClick(() => new DeviceManagerModal(this.app, this.plugin).open()));
+
+    new Setting(containerEl)
+      .setName("Initial sync after connecting")
+      .setDesc("After a new device connects, asks whether to import this vault into the account or begin from the account's server vault.")
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.autoInitialSyncAfterPairing !== false).onChange(async (value) => { this.plugin.settings.autoInitialSyncAfterPairing = value; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Automatic vault sync")
-      .setDesc("Syncs while Obsidian is open after local changes. Enable only after Syncthing is stopped for this vault.")
+      .setDesc("Checks and syncs when Obsidian opens or resumes, and after local changes. Enable only after Syncthing is stopped for this vault.")
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.automaticVaultSync).onChange(async (value) => { this.plugin.settings.automaticVaultSync = value; await this.plugin.saveSettings(); this.plugin.startVaultSyncPolling(); }));
 
     new Setting(containerEl)
@@ -623,43 +727,47 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync vault now")
-      .setDesc("Runs a manual three-way synchronization. The first run is server-authoritative and preserves local conflicts.")
+      .setDesc("Runs a manual three-way synchronization after the first-sync baseline has been established.")
       .addButton((button) => button.setButtonText("Sync now").onClick(() => this.plugin.syncVaultNow()));
 
     new Setting(containerEl)
-      .setName("API token")
-      .setDesc("Stored only in this device's local storage; it is not written to the synced vault.")
-      .addText((text) => {
-        text.inputEl.type = "password";
-        text.setPlaceholder("Bearer token").setValue(this.plugin.getToken());
-        text.onChange((value) => this.plugin.setToken(value.trim()));
-      });
-
-    new Setting(containerEl)
-      .setName("Vault Sync token")
-      .setDesc("A distinct device-local credential. It is never written to the synced vault.")
-      .addText((text) => { text.inputEl.type = "password"; text.setPlaceholder("Device token").setValue(this.plugin.getSyncToken()); text.onChange((value) => this.plugin.setSyncToken(value.trim())); });
-
-    new Setting(containerEl)
-      .setName("Test Calendar connection")
-      .setDesc("Checks the authenticated health endpoint without changing calendar data.")
-      .addButton((buttonEl) => buttonEl.setButtonText("Test").onClick(async () => {
-        try {
-          const health = await this.plugin.health();
-          new Notice(`Calendar API healthy (contract v${health.apiVersion || "?"}).`);
-        } catch (error) {
-          new Notice(error.message || String(error));
-        }
-      }));
-
-    new Setting(containerEl)
-      .setName("Test Vault Sync connection")
-      .setDesc("Checks the authenticated vault-sync health endpoint without changing files.")
-      .addButton((buttonEl) => buttonEl.setButtonText("Test").onClick(() => this.plugin.testSyncConnection()));
+      .setName("Check NAS connection")
+      .setDesc("Checks calendar and vault-sync access without transferring or changing data.")
+      .addButton((buttonEl) => buttonEl.setButtonText("Check connection").onClick(() => this.plugin.checkNasConnection()));
   }
 }
 
-class EnrollmentModal extends Modal {
+class DeviceManagerModal extends Modal {
+  constructor(app, plugin) { super(app); this.plugin = plugin; }
+
+  async onOpen() { await this.refresh(); }
+
+  async refresh() {
+    const el = this.contentEl;
+    el.empty();
+    el.createEl("h2", { text: "Your active devices" });
+    const status = el.createEl("p", { text: "Loading devices…" });
+    try {
+      const value = await this.plugin.activeDevices();
+      const devices = Array.isArray(value?.devices) ? value.devices : [];
+      status.setText(devices.length ? "These devices can currently access this account." : "No active devices are registered.");
+      for (const device of devices) {
+        if (!device || typeof device.name !== "string") continue;
+        const row = new Setting(el).setName(device.name).setDesc(formatLastSeen(device.lastSeenAt));
+        row.addButton((buttonEl) => buttonEl.setButtonText("Revoke").setWarning().onClick(async () => {
+          if (!window.confirm(`Revoke ${device.name}? Its access will stop immediately; account content is not deleted.`)) return;
+          await this.plugin.revokeActiveDevice(device.name);
+          if (device.name === this.plugin.settings.syncDeviceName) this.plugin.setDeviceCredential("");
+          await this.refresh();
+        }));
+      }
+    } catch (error) { status.setText(error.message || "Could not load devices."); }
+  }
+
+  onClose() { this.contentEl.empty(); }
+}
+
+class PortalEnrollmentModal extends Modal {
   constructor(app, plugin, portal, pairing) {
     super(app);
     this.plugin = plugin;
@@ -672,39 +780,33 @@ class EnrollmentModal extends Modal {
   onOpen() {
     const el = this.contentEl;
     el.empty();
-    el.createEl("h2", { text: "Connect this device to NAS" });
-    el.createEl("p", { text: "Approve this one-time code on the private enrollment page. No permanent credential is shown here." });
-    const code = el.createEl("code", { text: this.pairing.pairingCode });
-    code.setAttr("aria-label", "One-time pairing code");
-    const status = el.createEl("p", { text: "Waiting for approval…" });
-    const open = el.createEl("button", { text: "Open enrollment page" });
-    open.addEventListener("click", () => {
-      const url = new URL(this.portal);
-      if (!url.pathname.endsWith("/")) url.pathname += "/";
-      url.searchParams.set("code", this.pairing.pairingCode);
-      window.open(url.toString(), "_blank");
-    });
+    el.createEl("h2", { text: "Continue in NAS Vault" });
+    el.createEl("p", { text: "The private NAS page lets you sign in or register. It will authorize this device after email verification; the device credential is never displayed." });
+    const status = el.createEl("p", { text: "Opening the private NAS page…" });
+    const open = el.createEl("button", { text: "Open NAS Vault" });
+    open.addEventListener("click", () => this.openPortal());
+    this.openPortal();
     this.timer = window.setInterval(async () => {
       if (this.pollInFlight) return;
       this.pollInFlight = true;
       try {
-        const value = await enrollmentRequest(this.portal, `/api/v1/pairing/poll?token=${encodeURIComponent(this.pairing.pollToken)}`);
+        const value = await enrollmentRequest(this.portal, `/api/v2/pairing/poll?token=${encodeURIComponent(this.pairing.pollToken)}`);
         if (value.status === "complete") {
           window.clearInterval(this.timer);
-          this.plugin.settings.syncApiBaseUrl = value.apiBaseUrl;
-          this.plugin.settings.syncDeviceName = value.deviceName;
-          this.plugin.setSyncToken(value.token);
+          if (value.apiVersion !== 2 || typeof value.token !== "string") throw new Error("Enrollment portal returned an incompatible response.");
+          this.plugin.setDeviceCredential(value.token);
+          this.plugin.settings.initialSyncCompleted = false;
           await this.plugin.saveSettings();
-          if (this.plugin.settings.autoInitialSyncAfterPairing !== false && !this.plugin.settings.initialSyncCompleted && !loadSyncState()) {
-            status.setText("Device approved. Starting the initial server sync…");
-            const result = await this.plugin.initialServerSync({ confirm: false });
+          if (this.plugin.settings.autoInitialSyncAfterPairing !== false && !loadSyncState(this.plugin.syncStateScope())) {
+            status.setText("Device connected. Choose how to establish the first vault baseline…");
+            const result = await this.plugin.chooseInitialSync();
             if (result) {
-              status.setText(`Device approved and initial sync complete (${result.downloaded} downloaded, ${result.conflicts} conflicts preserved).`);
-              new Notice("NAS device pairing and initial vault sync complete.");
-            } else status.setText("Device approved, but the initial sync did not complete. Run the initial sync command to retry.");
+              status.setText(`Device connected and initial sync complete (${result.downloaded} downloaded, ${result.conflicts} conflicts preserved).`);
+              new Notice("NAS device connection and initial vault sync complete.");
+            } else status.setText("Device connected, but the initial sync did not complete. Run Sync vault now to retry.");
           } else {
-            status.setText("Device approved and configured. You can close this window.");
-            new Notice("NAS device pairing complete. The device token was stored locally.");
+            status.setText("Device connected. You can close this window.");
+            new Notice("NAS device connection complete.");
           }
         }
       } catch (error) {
@@ -714,6 +816,13 @@ class EnrollmentModal extends Modal {
         this.pollInFlight = false;
       }
     }, 2500);
+  }
+
+  openPortal() {
+    const url = new URL(this.portal);
+    if (!url.pathname.endsWith("/")) url.pathname += "/";
+    url.searchParams.set("pairing", this.pairing.pairingCode);
+    window.open(url.toString(), "_blank", "noopener,noreferrer");
   }
 
   onClose() {
@@ -735,19 +844,53 @@ async function loadLegacySettings(app) {
   }
 }
 
-async function enrollmentRequest(base, path, method = "GET", body = undefined) {
+function migrateSettings(value) {
+  const settings = Object.assign({}, DEFAULT_SETTINGS, value || {});
+  settings.nasBaseUrl = migrateNasBaseUrl(settings.nasBaseUrl, value || {});
+  delete settings.apiBaseUrl;
+  delete settings.syncApiBaseUrl;
+  delete settings.enrollmentPortalUrl;
+  delete settings.calendarId;
+  return settings;
+}
+
+function localVaultScope(app) {
+  const value = String(app?.vault?.adapter?.basePath || app?.vault?.getName?.() || "default");
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function localStateHash(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function formatLastSeen(value) {
+  if (!Number.isInteger(value) || value <= 0) return "Last contact is unavailable.";
+  return `Last online ${new Date(value * 1000).toLocaleString()}.`;
+}
+
+async function enrollmentRequest(base, path, method = "GET", body = undefined, credential = "") {
   let url;
   try {
     const parsed = new URL(base.trim());
     if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error();
     url = base.trim().replace(/\/$/, "") + path;
   } catch (_error) {
-    throw new Error("Configure a valid private enrollment portal URL.");
+    throw new Error("Configure a valid private NAS base URL.");
   }
   const response = await requestUrl({
     url,
     method,
-    headers: { Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+    headers: { Accept: "application/json", ...(body === undefined ? {} : { "Content-Type": "application/json" }), ...(credential ? { Authorization: `Bearer ${credential}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
     throw: false,
   });
