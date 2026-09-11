@@ -8,3 +8,9 @@ test("sync transport encodes paths and sends conditional binary writes", async (
 test("sync transport reports stale writes without exposing response content", async () => {
   await assert.rejects(() => syncRequest(async () => ({ status: 412, text: "secret backend error" }), "http://nas", "token", "/sync/v1/manifest"), /Vault changed remotely/);
 });
+test("sync transport permits double dots inside a filename while rejecting traversal segments", async () => {
+  let sent;
+  await syncRequest(async request => { sent = request; return { status: 200, text: "{}" }; }, "http://nas", "token", pathUrl("folder/2.1 Formulación q.org..pdf"));
+  assert.match(sent.url, /2\.1%20Formulaci%C3%B3n%20q\.org\.\.pdf$/);
+  await assert.rejects(() => syncRequest(async () => ({ status: 200, text: "{}" }), "http://nas", "token", "/sync/v1/files/folder/../secret"), /Invalid vault-sync API path/);
+});

@@ -9,7 +9,13 @@ export interface SyncState { entries: SyncEntry[]; revision: string; updatedAt: 
 export interface PendingUpload { uploadId: string; path: string; sha256: string; size: number; ifMatch?: string; ifRevision?: string; ifNoneMatch?: true }
 export interface SyncIssue { id: string; kind: "conflict" | "sync-failed"; path?: string; conflictPath?: string; detail: string; createdAt: string; reviewed?: boolean; base?: unknown; local?: unknown; remote?: unknown }
 export interface SyncTransactionEntry { path: string; localSha256?: string; remoteSha256?: string; remoteRevision?: string; absent?: boolean }
-export interface SyncTransaction { baseRevision: string; completed: Record<string, SyncTransactionEntry>; updatedAt: string }
+export interface SyncTransaction {
+  /** ordinary reconciliation or a resumable first-sync phase */
+  mode?: "ordinary" | "initial-server" | "initial-local";
+  baseRevision: string;
+  completed: Record<string, SyncTransactionEntry>;
+  updatedAt: string;
+}
 export interface ConflictRecord { conflictPath: string; path: string; localSha256: string; baseRevision?: string; remoteRevision?: string; createdAt: string }
 
 /** State stays outside vault files and is scoped to one local vault installation. */
@@ -26,6 +32,7 @@ export function loadSyncTransaction(scope?: string): SyncTransaction | undefined
   try {
     const value = JSON.parse(window.localStorage.getItem(scoped(TRANSACTION_KEY, scope)) || "null");
     if (!value || typeof value.baseRevision !== "string" || !value.completed || typeof value.completed !== "object") return undefined;
+    if (value.mode !== undefined && !["ordinary", "initial-server", "initial-local"].includes(value.mode)) return undefined;
     return value as SyncTransaction;
   } catch { return undefined; }
 }

@@ -96,7 +96,8 @@ async function syncRequest(transport, base, token, path, method = "GET", body, c
   if (!token) throw new Error("Connect this device to NAS first.");
   const url = new URL(base.trim());
   if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("Configure a valid private vault-sync API URL.");
-  if (!path.startsWith("/sync/v1/") || path.includes("..")) throw new Error("Invalid vault-sync API path.");
+  const route = path.split("?", 1)[0];
+  if (!route.startsWith("/sync/v1/") || route.split("/").some((segment) => segment === "." || segment === "..")) throw new Error("Invalid vault-sync API path.");
   const headers = { Authorization: `Bearer ${token}`, Accept: "application/json", ...condition };
   if (body !== void 0) headers["Content-Type"] = contentType;
   let response;
@@ -326,6 +327,7 @@ function loadSyncTransaction(scope) {
   try {
     const value = JSON.parse(window.localStorage.getItem(scoped(TRANSACTION_KEY, scope)) || "null");
     if (!value || typeof value.baseRevision !== "string" || !value.completed || typeof value.completed !== "object") return void 0;
+    if (value.mode !== void 0 && !["ordinary", "initial-server", "initial-local"].includes(value.mode)) return void 0;
     return value;
   } catch {
     return void 0;
@@ -446,6 +448,7 @@ var require_sync_engine = __commonJS({
     var { reconcile: reconcile2 } = (init_sync_reconcile(), __toCommonJS(sync_reconcile_exports));
     var { loadSyncState: loadSyncState2, saveSyncState: saveSyncState2, loadPendingUpload: loadPendingUpload2, savePendingUpload: savePendingUpload2, clearPendingUpload: clearPendingUpload2, recordSyncResult: recordSyncResult2, markSetupCopyRecovered: markSetupCopyRecovered2, loadSyncTransaction: loadSyncTransaction2, saveSyncTransaction: saveSyncTransaction2, clearSyncTransaction: clearSyncTransaction2, loadConflictRecord: loadConflictRecord2, saveConflictRecord: saveConflictRecord2 } = (init_sync_state(), __toCommonJS(sync_state_exports));
     var FALLBACK_CHUNK_SIZE = 4 * 1024 * 1024;
+    var INITIAL_SYNC_CONCURRENCY = 3;
     var syncBase = (plugin) => plugin.syncBaseUrl ? plugin.syncBaseUrl() : plugin.settings.syncApiBaseUrl;
     var deviceCredential = (plugin) => plugin.getDeviceCredential ? plugin.getDeviceCredential() : plugin.getSyncToken();
     var stateScope = (plugin) => plugin.syncStateScope ? plugin.syncStateScope() : void 0;
@@ -525,6 +528,41 @@ var require_sync_engine = __commonJS({
       transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
       return transaction;
     }
+    function initialTransaction(plugin, mode, revision) {
+      const existing = typeof loadSyncTransaction2 === "function" ? loadSyncTransaction2(stateScope(plugin)) : void 0;
+      if (existing && (existing.mode || "ordinary") === mode) return existing;
+      return { mode, baseRevision: revision, completed: {}, updatedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    }
+    function saveInitialTransaction(plugin, transaction) {
+      if (typeof saveSyncTransaction2 === "function") saveSyncTransaction2(transaction, stateScope(plugin));
+    }
+    function clearInitialTransaction(plugin) {
+      if (typeof clearSyncTransaction2 === "function") clearSyncTransaction2(stateScope(plugin));
+    }
+    async function localMatches(plugin, adapter, path, sha256sum) {
+      return await adapter.exists(path) && await sha256(await adapter.readBinary(path)) === sha256sum;
+    }
+    function initialCompletion(transaction, path, entry) {
+      transaction.completed[path] = { path, localSha256: entry.sha256, remoteSha256: entry.sha256, remoteRevision: entry.revision };
+      transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+    }
+    async function runWithConcurrency(items, limit, worker) {
+      let next = 0;
+      let firstError;
+      const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (firstError === void 0) {
+          const index = next++;
+          if (index >= items.length) return;
+          try {
+            await worker(items[index], index);
+          } catch (error) {
+            firstError = error;
+          }
+        }
+      });
+      await Promise.all(workers);
+      if (firstError !== void 0) throw firstError;
+    }
     function sameUpload(pending, local, remote) {
       return pending && pending.sha256 === local.sha256 && pending.size === local.size && pending.ifMatch === remote?.sha256 && pending.ifRevision === remote?.revision && Boolean(pending.ifNoneMatch) === !remote;
     }
@@ -566,28 +604,56 @@ var require_sync_engine = __commonJS({
       const adapter = plugin.app.vault.adapter;
       const result = { downloaded: 0, uploaded: 0, deleted: 0, conflicts: 0, skipped: 0 }, conflictPaths = [], conflictDetails = [];
       const remotePaths = new Set(remote.entries.map((entry) => entry.path));
-      for (const entry of remote.entries) {
+      const transaction = initialTransaction(plugin, "initial-server", remote.revision);
+      await runWithConcurrency(remote.entries, INITIAL_SYNC_CONCURRENCY, async (entry) => {
         if (classifyVaultPath2(entry.path).scope !== "shared") {
           result.skipped++;
-          continue;
+          return;
         }
-        if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) !== entry.sha256) {
+        if (transaction.completed[entry.path]?.remoteSha256 === entry.sha256 && await localMatches(plugin, adapter, entry.path, entry.sha256)) {
+          result.skipped++;
+          return;
+        }
+        if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) === entry.sha256) {
+          initialCompletion(transaction, entry.path, entry);
+          saveInitialTransaction(plugin, transaction);
+          result.skipped++;
+        } else if (await adapter.exists(entry.path)) {
           const bytes = await downloadBytes(plugin, entry);
           const conflict = await preserveLocalConflict(plugin, entry.path, { remoteSha256: entry.sha256, remoteRevision: entry.revision, baseRevision: remote.revision });
           if (conflict) conflictPaths.push(conflict);
           await adapter.writeBinary(entry.path, bytes);
           result.conflicts++;
-        } else await download(plugin, entry);
-        result.downloaded++;
-      }
+          result.downloaded++;
+          initialCompletion(transaction, entry.path, entry);
+          saveInitialTransaction(plugin, transaction);
+        } else {
+          await download(plugin, entry);
+          result.downloaded++;
+          initialCompletion(transaction, entry.path, entry);
+          saveInitialTransaction(plugin, transaction);
+        }
+      });
       for (const entry of await localManifest(plugin)) {
         if (remotePaths.has(entry.path)) continue;
+        if (classifyVaultPath2(entry.path).scope !== "shared") {
+          result.skipped++;
+          continue;
+        }
+        if (transaction.completed[entry.path]?.absent && !await adapter.exists(entry.path)) {
+          result.skipped++;
+          continue;
+        }
         const conflict = await preserveLocalConflict(plugin, entry.path);
         if (conflict) conflictPaths.push(conflict);
         await adapter.remove(entry.path);
         result.conflicts++;
+        transaction.completed[entry.path] = { path: entry.path, absent: true };
+        transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        saveInitialTransaction(plugin, transaction);
       }
       saveSyncState2(remote.entries, remote.revision, stateScope(plugin));
+      clearInitialTransaction(plugin);
       if (typeof recordSyncResult2 === "function") recordSyncResult2({ ...result, conflictPaths }, stateScope(plugin));
       return result;
     }
@@ -595,26 +661,45 @@ var require_sync_engine = __commonJS({
       const remote = await manifest2(requestUrl, syncBase(plugin), deviceCredential(plugin));
       const remoteByPath = new Map(remote.entries.map((entry) => [entry.path, entry]));
       const result = { downloaded: 0, uploaded: 0, deleted: 0, conflicts: 0, skipped: 0 }, conflictPaths = [];
+      const transaction = initialTransaction(plugin, "initial-local", remote.revision);
       for (const entry of await localManifest(plugin)) {
         if (classifyVaultPath2(entry.path).scope !== "shared") {
           result.skipped++;
           continue;
         }
         const server = remoteByPath.get(entry.path);
+        const completed2 = transaction.completed[entry.path];
+        if (completed2?.localSha256 === entry.sha256 && (!server || completed2.remoteSha256 === server.sha256)) {
+          result.skipped++;
+          continue;
+        }
         if (!server) {
           await resumableUpload(plugin, entry, void 0);
+          transaction.completed[entry.path] = { path: entry.path, localSha256: entry.sha256, remoteSha256: entry.sha256 };
+          transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+          saveInitialTransaction(plugin, transaction);
           result.uploaded++;
           continue;
         }
-        if (server.sha256 === entry.sha256) continue;
+        if (server.sha256 === entry.sha256) {
+          transaction.completed[entry.path] = { path: entry.path, localSha256: entry.sha256, remoteSha256: server.sha256, remoteRevision: server.revision };
+          transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+          saveInitialTransaction(plugin, transaction);
+          result.skipped++;
+          continue;
+        }
         const conflict = await preserveLocalConflict(plugin, entry.path);
         if (conflict) conflictPaths.push(conflict);
         await download(plugin, server);
         result.downloaded++;
         result.conflicts++;
+        transaction.completed[entry.path] = { path: entry.path, localSha256: server.sha256, remoteSha256: server.sha256, remoteRevision: server.revision };
+        transaction.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+        saveInitialTransaction(plugin, transaction);
       }
       const completed = await manifest2(requestUrl, syncBase(plugin), deviceCredential(plugin));
       saveSyncState2(completed.entries, completed.revision, stateScope(plugin));
+      clearInitialTransaction(plugin);
       if (typeof recordSyncResult2 === "function") recordSyncResult2({ ...result, conflictPaths }, stateScope(plugin));
       return result;
     }
@@ -758,14 +843,17 @@ var require_sync_engine = __commonJS({
 var require_overview = __commonJS({
   "src/overview.js"(exports2, module2) {
     var { ItemView, Modal, Notice, Setting } = require("obsidian");
-    var { loadSyncState: loadSyncState2, loadSyncIssues: loadSyncIssues2, markIssueReviewed: markIssueReviewed2 } = (init_sync_state(), __toCommonJS(sync_state_exports));
+    var { loadSyncState: loadSyncState2, loadSyncTransaction: loadSyncTransaction2, loadSyncIssues: loadSyncIssues2, markIssueReviewed: markIssueReviewed2 } = (init_sync_state(), __toCommonJS(sync_state_exports));
     var { recoverableSetupCopies } = require_sync_engine();
     var CONTROL_CENTER_VIEW_TYPE = "nas-vault-control-center";
     function statusFor(plugin, connection) {
       if (!plugin.getDeviceCredential()) return { tone: "grey", label: "No account connected", detail: "Connect this device to an existing account or register a new one." };
       if (!connection?.calendar || !connection?.sync || !connection?.device) return { tone: "red", label: "NAS unavailable", detail: "This device is signed in, but the NAS cannot be reached or no longer accepts its access." };
       if (plugin.vaultSyncRunning) return { tone: "blue", label: "Syncing", detail: "Reconciling this device with your private server vault." };
-      if (!plugin.settings.initialSyncCompleted || !loadSyncState2(plugin.syncStateScope())) return { tone: "yellow", label: "Initial sync needed", detail: "The account is connected; choose whether this device imports its vault or begins from the server vault." };
+      if (!plugin.settings.initialSyncCompleted || !loadSyncState2(plugin.syncStateScope())) {
+        const transaction = loadSyncTransaction2(plugin.syncStateScope());
+        return transaction ? { tone: "yellow", label: "Initial sync paused", detail: "A checkpoint is saved. Resume the vault sync to continue from the last verified file." } : { tone: "yellow", label: "Initial sync needed", detail: "The account is connected; choose whether this device imports its vault or begins from the server vault." };
+      }
       return { tone: "green", label: "Synced and healthy", detail: "NAS services are reachable and the latest local sync state is ready." };
     }
     var NasControlCenterView = class extends ItemView {
@@ -799,6 +887,13 @@ var require_overview = __commonJS({
         const copy = header.createDiv();
         copy.createEl("strong", { text: data.profile?.username || "No account connected" });
         copy.createEl("span", { text: status.label });
+        if (this.plugin.getDeviceCredential()) {
+          const check = header.createEl("button", { text: "Check connection", cls: "nas-vault-status__check" });
+          check.onclick = async () => {
+            check.disabled = true;
+            await this.render();
+          };
+        }
         el.createEl("p", { text: status.detail, cls: "nas-vault-status__detail" });
         const actions = el.createDiv({ cls: "nas-vault-actions" });
         const action = (label, callback, primary = false) => {
@@ -807,8 +902,9 @@ var require_overview = __commonJS({
         };
         if (!this.plugin.getDeviceCredential()) action("Connect this device", () => this.plugin.connectViaMultiUserEnrollment(), true);
         else if (!this.plugin.settings.initialSyncCompleted || !loadSyncState2(this.plugin.syncStateScope())) {
-          action("Set up vault sync", async () => {
-            await this.plugin.chooseInitialSync();
+          const resumed = Boolean(loadSyncTransaction2(this.plugin.syncStateScope()));
+          action(resumed ? "Resume vault sync" : "Set up vault sync", async () => {
+            await this.plugin.resumeInitialSync();
             await this.render();
           }, true);
           action("Open calendar", () => this.plugin.openCalendar());
@@ -842,16 +938,8 @@ var require_overview = __commonJS({
             new Notice(error.message || String(error));
           }
         }));
-        el.createEl("h2", { text: `Devices (${(profile.devices || []).length})` });
-        for (const item of profile.devices || []) new Setting(el).setName(item.name).setDesc(item.id === current.id ? "This device" : "Active device").addButton((b) => b.setButtonText("Revoke").setWarning().setDisabled(item.id === current.id).onClick(async () => {
-          if (!window.confirm(`Revoke ${item.name}?`)) return;
-          try {
-            await this.plugin.revokeActiveDevice(item.name);
-            await this.render();
-          } catch (error) {
-            new Notice(error.message || String(error));
-          }
-        }));
+        const devices = Array.isArray(profile.devices) ? profile.devices : [];
+        new Setting(el).setName("Devices on this account").setDesc(`${devices.length} active ${devices.length === 1 ? "device" : "devices"}. Device names are unique within this account.`).addButton((b) => b.setButtonText("Manage devices").onClick(() => new DeviceManagerModal(this.app, this.plugin, () => this.render()).open()));
         new Setting(el).setName("Account").setDesc("Logging out removes this device\u2019s local login only. Server content remains.").addButton((b) => b.setButtonText("Log out").setWarning().onClick(async () => {
           if (!window.confirm("Log out from this device?")) return;
           await this.plugin.disconnectThisDevice();
@@ -936,6 +1024,50 @@ var require_overview = __commonJS({
         }
       }
     };
+    var DeviceManagerModal = class extends Modal {
+      constructor(app, plugin, onChanged) {
+        super(app);
+        this.plugin = plugin;
+        this.onChanged = onChanged;
+      }
+      async onOpen() {
+        await this.refresh();
+      }
+      async refresh() {
+        const el = this.contentEl;
+        el.empty();
+        el.createEl("h2", { text: "Devices on this account" });
+        const status = el.createEl("p", { text: "Loading devices\u2026", cls: "nas-vault-modal-status" });
+        try {
+          const value = await this.plugin.activeDevices();
+          const devices = Array.isArray(value?.devices) ? value.devices : [];
+          status.setText(devices.length ? "These devices can currently access this account." : "No active devices are registered.");
+          for (const device of devices) {
+            if (!device || typeof device.name !== "string") continue;
+            const row = new Setting(el).setName(device.name).setDesc(device.name === this.plugin.settings.syncDeviceName ? `This device \xB7 ${formatLastSeen(device.lastSeenAt)}` : formatLastSeen(device.lastSeenAt));
+            row.addButton((button) => button.setButtonText("Revoke").setWarning().setDisabled(device.name === this.plugin.settings.syncDeviceName).onClick(async () => {
+              if (!window.confirm(`Revoke ${device.name}? Its access will stop immediately; account content is not deleted.`)) return;
+              try {
+                await this.plugin.revokeActiveDevice(device.name);
+                await this.refresh();
+                if (this.onChanged) await this.onChanged();
+              } catch (error) {
+                new Notice(error.message || String(error));
+              }
+            }));
+          }
+        } catch (error) {
+          status.setText(error.message || "Could not load devices.");
+        }
+      }
+      onClose() {
+        this.contentEl.empty();
+      }
+    };
+    function formatLastSeen(value) {
+      if (!Number.isInteger(value) || value <= 0) return "Last contact unavailable.";
+      return `Last online ${new Date(value * 1e3).toLocaleString()}.`;
+    }
     var ConflictModal = class extends Modal {
       constructor(app, plugin, issue, onDone) {
         super(app);
@@ -1133,7 +1265,7 @@ var require_calendar = __commonJS({
     var { syncRequest: syncRequest2, exportAccount: exportAccount2, importAccount: importAccount2, history: history2, trash: trash2, revisionContent: revisionContent2, restoreRevision: restoreRevision2 } = (init_sync_api(), __toCommonJS(sync_api_exports));
     var { initialServerSync, initialLocalImport, recoverSetupCopies, renameNow, resolveConflict } = require_sync_engine();
     var { syncNow } = require_sync_engine();
-    var { loadSyncState: loadSyncState2 } = (init_sync_state(), __toCommonJS(sync_state_exports));
+    var { loadSyncState: loadSyncState2, loadSyncTransaction: loadSyncTransaction2 } = (init_sync_state(), __toCommonJS(sync_state_exports));
     var { NasControlCenterView, CONTROL_CENTER_VIEW_TYPE } = require_overview();
     var { migrateNasBaseUrl: migrateNasBaseUrl2, serviceBaseUrl: serviceBaseUrl2 } = (init_service_url(), __toCommonJS(service_url_exports));
     var VIEW_TYPE = "nas-calendar-bridge-view";
@@ -1433,6 +1565,12 @@ var require_calendar = __commonJS({
       async chooseInitialSync() {
         const importLocal = window.confirm("This is the first sync for this device. Press OK to import this device's shared vault into the new server account. Press Cancel to start from the server vault instead.");
         return importLocal ? this.initialLocalImport() : this.initialServerSync({ confirm: false });
+      }
+      async resumeInitialSync() {
+        const transaction = loadSyncTransaction2(this.syncStateScope());
+        if (!transaction) return this.chooseInitialSync();
+        if (transaction.mode === "initial-local") return this.initialLocalImport();
+        return this.initialServerSync({ confirm: false });
       }
       async syncVaultNow(options = {}) {
         if (this.vaultSyncRunning) return;
@@ -1761,7 +1899,6 @@ var require_calendar = __commonJS({
           await this.plugin.saveSettings();
         }));
         new Setting(containerEl).setName("Connect to NAS").setDesc("Register a new account or sign in and connect this device. The NAS stores its credential locally.").addButton((button2) => button2.setButtonText("Connect to NAS").onClick(() => this.plugin.connectViaMultiUserEnrollment()));
-        new Setting(containerEl).setName("Your active devices").setDesc("Shows devices currently authorized for this account. Devices unseen for 30 days are removed automatically.").addButton((button2) => button2.setButtonText("Manage devices").onClick(() => new DeviceManagerModal(this.app, this.plugin).open()));
         new Setting(containerEl).setName("Initial sync after connecting").setDesc("After a new device connects, asks whether to import this vault into the account or begin from the account's server vault.").addToggle((toggle) => toggle.setValue(this.plugin.settings.autoInitialSyncAfterPairing !== false).onChange(async (value) => {
           this.plugin.settings.autoInitialSyncAfterPairing = value;
           await this.plugin.saveSettings();
@@ -1783,42 +1920,6 @@ var require_calendar = __commonJS({
           });
         });
         new Setting(containerEl).setName("Sync vault now").setDesc("Runs a manual three-way synchronization after the first-sync baseline has been established.").addButton((button2) => button2.setButtonText("Sync now").onClick(() => this.plugin.syncVaultNow()));
-        new Setting(containerEl).setName("Check NAS connection").setDesc("Checks calendar and vault-sync access without transferring or changing data.").addButton((buttonEl) => buttonEl.setButtonText("Check connection").onClick(() => this.plugin.checkNasConnection()));
-      }
-    };
-    var DeviceManagerModal = class extends Modal {
-      constructor(app, plugin) {
-        super(app);
-        this.plugin = plugin;
-      }
-      async onOpen() {
-        await this.refresh();
-      }
-      async refresh() {
-        const el = this.contentEl;
-        el.empty();
-        el.createEl("h2", { text: "Your active devices" });
-        const status = el.createEl("p", { text: "Loading devices\u2026" });
-        try {
-          const value = await this.plugin.activeDevices();
-          const devices = Array.isArray(value?.devices) ? value.devices : [];
-          status.setText(devices.length ? "These devices can currently access this account." : "No active devices are registered.");
-          for (const device of devices) {
-            if (!device || typeof device.name !== "string") continue;
-            const row = new Setting(el).setName(device.name).setDesc(formatLastSeen(device.lastSeenAt));
-            row.addButton((buttonEl) => buttonEl.setButtonText("Revoke").setWarning().onClick(async () => {
-              if (!window.confirm(`Revoke ${device.name}? Its access will stop immediately; account content is not deleted.`)) return;
-              await this.plugin.revokeActiveDevice(device.name);
-              if (device.name === this.plugin.settings.syncDeviceName) this.plugin.setDeviceCredential("");
-              await this.refresh();
-            }));
-          }
-        } catch (error) {
-          status.setText(error.message || "Could not load devices.");
-        }
-      }
-      onClose() {
-        this.contentEl.empty();
       }
     };
     var PortalEnrollmentModal = class extends Modal {
@@ -1918,10 +2019,6 @@ var require_calendar = __commonJS({
         hash = Math.imul(hash, 16777619);
       }
       return (hash >>> 0).toString(36);
-    }
-    function formatLastSeen(value) {
-      if (!Number.isInteger(value) || value <= 0) return "Last contact is unavailable.";
-      return `Last online ${new Date(value * 1e3).toLocaleString()}.`;
     }
     async function enrollmentRequest(base, path, method = "GET", body = void 0, credential = "") {
       let url;

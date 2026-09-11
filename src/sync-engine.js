@@ -6,6 +6,7 @@ const { reconcile } = require("./sync-reconcile");
 const { loadSyncState, saveSyncState, loadPendingUpload, savePendingUpload, clearPendingUpload, recordSyncResult, markSetupCopyRecovered, loadSyncTransaction, saveSyncTransaction, clearSyncTransaction, loadConflictRecord, saveConflictRecord } = require("./sync-state");
 
 const FALLBACK_CHUNK_SIZE = 4 * 1024 * 1024;
+const INITIAL_SYNC_CONCURRENCY = 3;
 const syncBase = plugin => plugin.syncBaseUrl ? plugin.syncBaseUrl() : plugin.settings.syncApiBaseUrl;
 const deviceCredential = plugin => plugin.getDeviceCredential ? plugin.getDeviceCredential() : plugin.getSyncToken();
 const stateScope = plugin => plugin.syncStateScope ? plugin.syncStateScope() : undefined;
@@ -98,6 +99,44 @@ function recordCompletion(transaction, action) {
   return transaction;
 }
 
+function initialTransaction(plugin, mode, revision) {
+  const existing = typeof loadSyncTransaction === "function" ? loadSyncTransaction(stateScope(plugin)) : undefined;
+  if (existing && (existing.mode || "ordinary") === mode) return existing;
+  return { mode, baseRevision: revision, completed: {}, updatedAt: new Date().toISOString() };
+}
+
+// The initial pass is deliberately checkpointed after every verified file. A
+// later manifest may have a different overall revision, so completion is
+// validated by the file digest rather than by the manifest revision alone.
+function saveInitialTransaction(plugin, transaction) {
+  if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin));
+}
+function clearInitialTransaction(plugin) {
+  if (typeof clearSyncTransaction === "function") clearSyncTransaction(stateScope(plugin));
+}
+async function localMatches(plugin, adapter, path, sha256sum) {
+  return await adapter.exists(path) && await sha256(await adapter.readBinary(path)) === sha256sum;
+}
+function initialCompletion(transaction, path, entry) {
+  transaction.completed[path] = { path, localSha256: entry.sha256, remoteSha256: entry.sha256, remoteRevision: entry.revision };
+  transaction.updatedAt = new Date().toISOString();
+}
+
+async function runWithConcurrency(items, limit, worker) {
+  let next = 0;
+  let firstError;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (firstError === undefined) {
+      const index = next++;
+      if (index >= items.length) return;
+      try { await worker(items[index], index); }
+      catch (error) { firstError = error; }
+    }
+  });
+  await Promise.all(workers);
+  if (firstError !== undefined) throw firstError;
+}
+
 function sameUpload(pending, local, remote) {
   return pending && pending.sha256 === local.sha256 && pending.size === local.size && pending.ifMatch === remote?.sha256 && pending.ifRevision === remote?.revision && Boolean(pending.ifNoneMatch) === !remote;
 }
@@ -135,22 +174,50 @@ async function initialServerSync(plugin) {
   const adapter = plugin.app.vault.adapter;
   const result = { downloaded: 0, uploaded: 0, deleted: 0, conflicts: 0, skipped: 0 }, conflictPaths = [], conflictDetails = [];
   const remotePaths = new Set(remote.entries.map(entry => entry.path));
-  for (const entry of remote.entries) {
-    if (classifyVaultPath(entry.path).scope !== "shared") { result.skipped++; continue; }
-    if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) !== entry.sha256) {
+  const transaction = initialTransaction(plugin, "initial-server", remote.revision);
+  await runWithConcurrency(remote.entries, INITIAL_SYNC_CONCURRENCY, async (entry) => {
+    if (classifyVaultPath(entry.path).scope !== "shared") { result.skipped++; return; }
+    // A completed file is valid only when its verified bytes are still local
+    // and match the current server digest. This makes retries safe even if the
+    // manifest revision changed because another file changed meanwhile.
+    if (transaction.completed[entry.path]?.remoteSha256 === entry.sha256 && await localMatches(plugin, adapter, entry.path, entry.sha256)) {
+      result.skipped++;
+      return;
+    }
+    if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) === entry.sha256) {
+      initialCompletion(transaction, entry.path, entry);
+      saveInitialTransaction(plugin, transaction);
+      result.skipped++;
+    } else if (await adapter.exists(entry.path)) {
       const bytes = await downloadBytes(plugin, entry);
       const conflict = await preserveLocalConflict(plugin, entry.path, { remoteSha256: entry.sha256, remoteRevision: entry.revision, baseRevision: remote.revision });
       if (conflict) conflictPaths.push(conflict); await adapter.writeBinary(entry.path, bytes); result.conflicts++;
-    } else await download(plugin, entry);
-    result.downloaded++;
-  }
+      result.downloaded++;
+      initialCompletion(transaction, entry.path, entry);
+      saveInitialTransaction(plugin, transaction);
+    } else {
+      await download(plugin, entry);
+      result.downloaded++;
+      initialCompletion(transaction, entry.path, entry);
+      saveInitialTransaction(plugin, transaction);
+    }
+  });
+  // Enumerate local-only files only after the remote pass. This keeps a large
+  // vault from spending its entire first-sync startup hashing local content
+  // before any missing server file can be downloaded.
   for (const entry of await localManifest(plugin)) {
     if (remotePaths.has(entry.path)) continue;
+    if (classifyVaultPath(entry.path).scope !== "shared") { result.skipped++; continue; }
+    if (transaction.completed[entry.path]?.absent && !await adapter.exists(entry.path)) { result.skipped++; continue; }
     const conflict = await preserveLocalConflict(plugin, entry.path); if (conflict) conflictPaths.push(conflict);
     await adapter.remove(entry.path);
     result.conflicts++;
+    transaction.completed[entry.path] = { path: entry.path, absent: true };
+    transaction.updatedAt = new Date().toISOString();
+    saveInitialTransaction(plugin, transaction);
   }
   saveSyncState(remote.entries, remote.revision, stateScope(plugin));
+  clearInitialTransaction(plugin);
   if (typeof recordSyncResult === "function") recordSyncResult({ ...result, conflictPaths }, stateScope(plugin)); return result;
 }
 
@@ -158,16 +225,31 @@ async function initialLocalImport(plugin) {
   const remote = await manifest(requestUrl, syncBase(plugin), deviceCredential(plugin));
   const remoteByPath = new Map(remote.entries.map(entry => [entry.path, entry]));
   const result = { downloaded: 0, uploaded: 0, deleted: 0, conflicts: 0, skipped: 0 }, conflictPaths = [];
+  const transaction = initialTransaction(plugin, "initial-local", remote.revision);
   for (const entry of await localManifest(plugin)) {
     if (classifyVaultPath(entry.path).scope !== "shared") { result.skipped++; continue; }
     const server = remoteByPath.get(entry.path);
-    if (!server) { await resumableUpload(plugin, entry, undefined); result.uploaded++; continue; }
-    if (server.sha256 === entry.sha256) continue;
+    const completed = transaction.completed[entry.path];
+    if (completed?.localSha256 === entry.sha256 && (!server || completed.remoteSha256 === server.sha256)) { result.skipped++; continue; }
+    if (!server) {
+      await resumableUpload(plugin, entry, undefined);
+      transaction.completed[entry.path] = { path: entry.path, localSha256: entry.sha256, remoteSha256: entry.sha256 };
+      transaction.updatedAt = new Date().toISOString(); saveInitialTransaction(plugin, transaction);
+      result.uploaded++; continue;
+    }
+    if (server.sha256 === entry.sha256) {
+      transaction.completed[entry.path] = { path: entry.path, localSha256: entry.sha256, remoteSha256: server.sha256, remoteRevision: server.revision };
+      transaction.updatedAt = new Date().toISOString(); saveInitialTransaction(plugin, transaction);
+      result.skipped++; continue;
+    }
     const conflict = await preserveLocalConflict(plugin, entry.path); if (conflict) conflictPaths.push(conflict);
     await download(plugin, server); result.downloaded++; result.conflicts++;
+    transaction.completed[entry.path] = { path: entry.path, localSha256: server.sha256, remoteSha256: server.sha256, remoteRevision: server.revision };
+    transaction.updatedAt = new Date().toISOString(); saveInitialTransaction(plugin, transaction);
   }
   const completed = await manifest(requestUrl, syncBase(plugin), deviceCredential(plugin));
   saveSyncState(completed.entries, completed.revision, stateScope(plugin));
+  clearInitialTransaction(plugin);
   if (typeof recordSyncResult === "function") recordSyncResult({ ...result, conflictPaths }, stateScope(plugin)); return result;
 }
 

@@ -15,7 +15,7 @@ const { requestApi } = require("./api");
 const { syncRequest, exportAccount, importAccount, history, trash, revisionContent, restoreRevision } = require("./sync-api");
 const { initialServerSync, initialLocalImport, recoverSetupCopies, renameNow, resolveConflict } = require("./sync-engine");
 const { syncNow } = require("./sync-engine");
-const { loadSyncState } = require("./sync-state");
+const { loadSyncState, loadSyncTransaction } = require("./sync-state");
 const { NasControlCenterView, CONTROL_CENTER_VIEW_TYPE } = require("./overview");
 const { migrateNasBaseUrl, serviceBaseUrl } = require("./service-url");
 
@@ -306,6 +306,13 @@ class NasCalendarBridge extends Plugin {
   async chooseInitialSync() {
     const importLocal = window.confirm("This is the first sync for this device. Press OK to import this device's shared vault into the new server account. Press Cancel to start from the server vault instead.");
     return importLocal ? this.initialLocalImport() : this.initialServerSync({ confirm: false });
+  }
+
+  async resumeInitialSync() {
+    const transaction = loadSyncTransaction(this.syncStateScope());
+    if (!transaction) return this.chooseInitialSync();
+    if (transaction.mode === "initial-local") return this.initialLocalImport();
+    return this.initialServerSync({ confirm: false });
   }
 
   async syncVaultNow(options = {}) {
@@ -706,11 +713,6 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
       .addButton((button) => button.setButtonText("Connect to NAS").onClick(() => this.plugin.connectViaMultiUserEnrollment()));
 
     new Setting(containerEl)
-      .setName("Your active devices")
-      .setDesc("Shows devices currently authorized for this account. Devices unseen for 30 days are removed automatically.")
-      .addButton((button) => button.setButtonText("Manage devices").onClick(() => new DeviceManagerModal(this.app, this.plugin).open()));
-
-    new Setting(containerEl)
       .setName("Initial sync after connecting")
       .setDesc("After a new device connects, asks whether to import this vault into the account or begin from the account's server vault.")
       .addToggle((toggle) => toggle.setValue(this.plugin.settings.autoInitialSyncAfterPairing !== false).onChange(async (value) => { this.plugin.settings.autoInitialSyncAfterPairing = value; await this.plugin.saveSettings(); }));
@@ -730,41 +732,7 @@ class CalendarBridgeSettingsTab extends PluginSettingTab {
       .setDesc("Runs a manual three-way synchronization after the first-sync baseline has been established.")
       .addButton((button) => button.setButtonText("Sync now").onClick(() => this.plugin.syncVaultNow()));
 
-    new Setting(containerEl)
-      .setName("Check NAS connection")
-      .setDesc("Checks calendar and vault-sync access without transferring or changing data.")
-      .addButton((buttonEl) => buttonEl.setButtonText("Check connection").onClick(() => this.plugin.checkNasConnection()));
   }
-}
-
-class DeviceManagerModal extends Modal {
-  constructor(app, plugin) { super(app); this.plugin = plugin; }
-
-  async onOpen() { await this.refresh(); }
-
-  async refresh() {
-    const el = this.contentEl;
-    el.empty();
-    el.createEl("h2", { text: "Your active devices" });
-    const status = el.createEl("p", { text: "Loading devices…" });
-    try {
-      const value = await this.plugin.activeDevices();
-      const devices = Array.isArray(value?.devices) ? value.devices : [];
-      status.setText(devices.length ? "These devices can currently access this account." : "No active devices are registered.");
-      for (const device of devices) {
-        if (!device || typeof device.name !== "string") continue;
-        const row = new Setting(el).setName(device.name).setDesc(formatLastSeen(device.lastSeenAt));
-        row.addButton((buttonEl) => buttonEl.setButtonText("Revoke").setWarning().onClick(async () => {
-          if (!window.confirm(`Revoke ${device.name}? Its access will stop immediately; account content is not deleted.`)) return;
-          await this.plugin.revokeActiveDevice(device.name);
-          if (device.name === this.plugin.settings.syncDeviceName) this.plugin.setDeviceCredential("");
-          await this.refresh();
-        }));
-      }
-    } catch (error) { status.setText(error.message || "Could not load devices."); }
-  }
-
-  onClose() { this.contentEl.empty(); }
 }
 
 class PortalEnrollmentModal extends Modal {
@@ -871,11 +839,6 @@ function localStateHash(value) {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
-}
-
-function formatLastSeen(value) {
-  if (!Number.isInteger(value) || value <= 0) return "Last contact is unavailable.";
-  return `Last online ${new Date(value * 1000).toLocaleString()}.`;
 }
 
 async function enrollmentRequest(base, path, method = "GET", body = undefined, credential = "") {

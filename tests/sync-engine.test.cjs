@@ -96,6 +96,51 @@ test("initial server-authoritative sync creates parent directories for downloade
   assert.equal(text(files.get(remote.path)), "server");
 });
 
+test("initial server sync checkpoints each verified file and resumes without replaying it", async () => {
+  const a = { path: "a.md", sha256: createHash("sha256").update("aaa").digest("hex"), size: 3, modifiedAt: "2026-09-08T00:00:00Z", revision: "r-a" };
+  const b = { path: "b.md", sha256: createHash("sha256").update("bbb").digest("hex"), size: 3, modifiedAt: "2026-09-08T00:00:00Z", revision: "r-b" };
+  const files = new Map(), downloads = [];
+  let transaction, failB = true;
+  const require = name => ({
+    obsidian: { requestUrl: async () => ({}) },
+    "./sync-api": {
+      manifest: async () => ({ entries: [a, b], revision: "server-revision" }),
+      pathUrl: path => path,
+      syncRequest: async (_requestUrl, _base, _token, path) => {
+        downloads.push(path);
+        if (path === "b.md" && failB) { failB = false; throw new Error("temporary download failure"); }
+        return { arrayBuffer: bytes(path === "a.md" ? "aaa" : "bbb") };
+      },
+    },
+    "./scope": { classifyVaultPath: () => ({ scope: "shared" }) },
+    "./sync-plan": { conflictPath: path => `${path}.conflict` },
+    "./sync-reconcile": { reconcile: () => [] },
+    "./sync-state": {
+      loadSyncState: () => undefined, saveSyncState: () => {},
+      loadSyncTransaction: () => transaction,
+      saveSyncTransaction: value => { transaction = JSON.parse(JSON.stringify(value)); },
+      clearSyncTransaction: () => { transaction = undefined; },
+      loadPendingUpload: () => undefined, savePendingUpload: () => {}, clearPendingUpload: () => {},
+    },
+  })[name];
+  const context = { module: { exports: {} }, require, crypto: webcrypto, Uint8Array, Array, Date, Error, Set };
+  vm.runInNewContext(readFileSync(join(__dirname, "../src/sync-engine.js"), "utf8"), context);
+  const adapter = {
+    exists: async path => files.has(path), readBinary: async path => files.get(path),
+    writeBinary: async (path, value) => files.set(path, value), remove: async path => files.delete(path),
+  };
+  const plugin = { settings: { syncApiBaseUrl: "http://private", syncDeviceName: "device" }, getSyncToken: () => "test-token", app: { vault: { adapter, getFiles: () => [...files].map(([path]) => ({ path, stat: { mtime: 0 } })) } } };
+  await assert.rejects(() => context.module.exports.initialServerSync(plugin), /temporary download failure/);
+  assert.deepEqual(downloads, ["a.md", "b.md"]);
+  const result = await context.module.exports.initialServerSync(plugin);
+  assert.equal(result.downloaded, 1);
+  assert.equal(result.skipped, 1);
+  assert.deepEqual(downloads, ["a.md", "b.md", "b.md"]);
+  assert.equal(transaction, undefined);
+  assert.equal(text(files.get("a.md")), "aaa");
+  assert.equal(text(files.get("b.md")), "bbb");
+});
+
 test("initial local import uploads local-only files without falsely preserving them as conflicts", async () => {
   const localOnly = bytes("");
   const remoteSame = { path: "same.md", sha256: createHash("sha256").update("same").digest("hex"), size: 4, modifiedAt: "2026-09-08T00:00:00Z" };
@@ -124,7 +169,7 @@ test("initial local import uploads local-only files without falsely preserving t
     app: { vault: { adapter: { exists: async path => files.has(path), readBinary: async path => files.get(path), writeBinary: async (path, value) => files.set(path, value), remove: async path => files.delete(path) }, getFiles: () => [...files].map(([path]) => ({ path, stat: { mtime: 0 } })) } },
   };
   const result = await context.module.exports.initialLocalImport(plugin);
-  assert.deepEqual({ ...result }, { downloaded: 0, uploaded: 1, deleted: 0, conflicts: 0, skipped: 0 });
+  assert.deepEqual({ ...result }, { downloaded: 0, uploaded: 1, deleted: 0, conflicts: 0, skipped: 1 });
   assert.deepEqual(uploaded.map(value => ({ ...value })), [{ path: "local-only.md", size: 0, sha256: createHash("sha256").update("").digest("hex"), ifNoneMatch: true }]);
   assert.equal(files.has("local-only.md.conflict"), false);
   assert.deepEqual(saved, { entries: [remoteSame], revision: "server-revision" });

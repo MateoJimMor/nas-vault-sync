@@ -8,7 +8,10 @@ export async function syncRequest(transport: Transport, base: string, token: str
   if (!token) throw new Error("Connect this device to NAS first.");
   const url = new URL(base.trim());
   if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("Configure a valid private vault-sync API URL.");
-  if (!path.startsWith("/sync/v1/") || path.includes("..")) throw new Error("Invalid vault-sync API path.");
+  // Reject traversal segments, not harmless filename text such as
+  // `report..pdf` or `2.1 Formulación q.org..pdf`.
+  const route = path.split("?", 1)[0];
+  if (!route.startsWith("/sync/v1/") || route.split("/").some(segment => segment === "." || segment === "..")) throw new Error("Invalid vault-sync API path.");
   const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json", ...condition };
   if (body !== undefined) headers["Content-Type"] = contentType;
   let response: any; try { response = await transport({ url: base.replace(/\/$/, "") + path, method, headers, body, throw: false }); } catch { throw new Error("Cannot reach the private vault-sync service."); }

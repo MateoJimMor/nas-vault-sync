@@ -1,5 +1,5 @@
 const { ItemView, Modal, Notice, Setting } = require("obsidian");
-const { loadSyncState, loadSyncIssues, markIssueReviewed } = require("./sync-state");
+const { loadSyncState, loadSyncTransaction, loadSyncIssues, markIssueReviewed } = require("./sync-state");
 const { recoverableSetupCopies } = require("./sync-engine");
 const CONTROL_CENTER_VIEW_TYPE = "nas-vault-control-center";
 
@@ -7,7 +7,12 @@ function statusFor(plugin, connection) {
   if (!plugin.getDeviceCredential()) return { tone: "grey", label: "No account connected", detail: "Connect this device to an existing account or register a new one." };
   if (!connection?.calendar || !connection?.sync || !connection?.device) return { tone: "red", label: "NAS unavailable", detail: "This device is signed in, but the NAS cannot be reached or no longer accepts its access." };
   if (plugin.vaultSyncRunning) return { tone: "blue", label: "Syncing", detail: "Reconciling this device with your private server vault." };
-  if (!plugin.settings.initialSyncCompleted || !loadSyncState(plugin.syncStateScope())) return { tone: "yellow", label: "Initial sync needed", detail: "The account is connected; choose whether this device imports its vault or begins from the server vault." };
+  if (!plugin.settings.initialSyncCompleted || !loadSyncState(plugin.syncStateScope())) {
+    const transaction = loadSyncTransaction(plugin.syncStateScope());
+    return transaction
+      ? { tone: "yellow", label: "Initial sync paused", detail: "A checkpoint is saved. Resume the vault sync to continue from the last verified file." }
+      : { tone: "yellow", label: "Initial sync needed", detail: "The account is connected; choose whether this device imports its vault or begins from the server vault." };
+  }
   return { tone: "green", label: "Synced and healthy", detail: "NAS services are reachable and the latest local sync state is ready." };
 }
 
@@ -23,12 +28,17 @@ class NasControlCenterView extends ItemView {
     const data = await this.loadProfile(), status = statusFor(this.plugin, data.connection);
     const header = el.createDiv({ cls: `nas-vault-status nas-vault-status--${status.tone}` }); header.createSpan({ cls: "nas-vault-status__dot" });
     const copy = header.createDiv(); copy.createEl("strong", { text: data.profile?.username || "No account connected" }); copy.createEl("span", { text: status.label });
+    if (this.plugin.getDeviceCredential()) {
+      const check = header.createEl("button", { text: "Check connection", cls: "nas-vault-status__check" });
+      check.onclick = async () => { check.disabled = true; await this.render(); };
+    }
     el.createEl("p", { text: status.detail, cls: "nas-vault-status__detail" });
     const actions = el.createDiv({ cls: "nas-vault-actions" });
     const action = (label, callback, primary = false) => { const button = actions.createEl("button", { text: label, cls: primary ? "mod-cta" : "" }); button.onclick = () => void callback(); };
     if (!this.plugin.getDeviceCredential()) action("Connect this device", () => this.plugin.connectViaMultiUserEnrollment(), true);
     else if (!this.plugin.settings.initialSyncCompleted || !loadSyncState(this.plugin.syncStateScope())) {
-      action("Set up vault sync", async () => { await this.plugin.chooseInitialSync(); await this.render(); }, true);
+      const resumed = Boolean(loadSyncTransaction(this.plugin.syncStateScope()));
+      action(resumed ? "Resume vault sync" : "Set up vault sync", async () => { await this.plugin.resumeInitialSync(); await this.render(); }, true);
       action("Open calendar", () => this.plugin.openCalendar()); action("Refresh status", () => this.render());
     } else { action("Sync now", async () => { await this.plugin.syncVaultNow(); await this.render(); }, true); action("Open calendar", () => this.plugin.openCalendar()); action("Refresh status", () => this.render()); }
     if (data.profile) this.renderAccount(el, data.profile);
@@ -42,8 +52,11 @@ class NasControlCenterView extends ItemView {
   renderAccount(el, profile) {
     const current = profile.currentDevice || {}; el.createEl("h2", { text: "This device" });
     new Setting(el).setName(current.name || "Connected device").setDesc(`Account: ${profile.username}`).addButton(b => b.setButtonText("Rename").onClick(async () => { const name = window.prompt("New device name", current.name || ""); if (!name) return; try { await this.plugin.renameThisDevice(name); await this.render(); } catch (error) { new Notice(error.message || String(error)); } }));
-    el.createEl("h2", { text: `Devices (${(profile.devices || []).length})` });
-    for (const item of profile.devices || []) new Setting(el).setName(item.name).setDesc(item.id === current.id ? "This device" : "Active device").addButton(b => b.setButtonText("Revoke").setWarning().setDisabled(item.id === current.id).onClick(async () => { if (!window.confirm(`Revoke ${item.name}?`)) return; try { await this.plugin.revokeActiveDevice(item.name); await this.render(); } catch (error) { new Notice(error.message || String(error)); } }));
+    const devices = Array.isArray(profile.devices) ? profile.devices : [];
+    new Setting(el)
+      .setName("Devices on this account")
+      .setDesc(`${devices.length} active ${devices.length === 1 ? "device" : "devices"}. Device names are unique within this account.`)
+      .addButton(b => b.setButtonText("Manage devices").onClick(() => new DeviceManagerModal(this.app, this.plugin, () => this.render()).open()));
     new Setting(el).setName("Account").setDesc("Logging out removes this device’s local login only. Server content remains.").addButton(b => b.setButtonText("Log out").setWarning().onClick(async () => { if (!window.confirm("Log out from this device?")) return; await this.plugin.disconnectThisDevice(); await this.render(); }));
     new Setting(el).setName("Account data").setDesc("Export includes current files, immutable revisions, and quarantined deletions. Imports never overwrite existing files.").addButton(b => b.setButtonText("Export account").onClick(async () => { try { await this.plugin.exportAccountArchive(); } catch (error) { new Notice(error.message || String(error)); } })).addButton(b => b.setButtonText("Import account").onClick(() => {
       const input = document.createElement("input"); input.type = "file"; input.accept = ".zip,application/zip"; input.onchange = async () => { const file = input.files?.[0]; if (!file) return; try { const preview = await this.plugin.importAccountArchive(file, true); if (!window.confirm(`Import ${preview.wouldCreate?.length || 0} new files? Existing files will be skipped.`)) return; const result = await this.plugin.importAccountArchive(file, false); new Notice(`Imported ${result.created?.length || 0} files; skipped ${result.skipped?.length || 0}.`); await this.render(); } catch (error) { new Notice(error.message || String(error)); } }; input.click();
@@ -81,6 +94,35 @@ class NasControlCenterView extends ItemView {
       }
     } catch (_error) { /* History is optional when the NAS is offline. */ }
   }
+}
+
+class DeviceManagerModal extends Modal {
+  constructor(app, plugin, onChanged) { super(app); this.plugin = plugin; this.onChanged = onChanged; }
+  async onOpen() { await this.refresh(); }
+  async refresh() {
+    const el = this.contentEl; el.empty(); el.createEl("h2", { text: "Devices on this account" });
+    const status = el.createEl("p", { text: "Loading devices…", cls: "nas-vault-modal-status" });
+    try {
+      const value = await this.plugin.activeDevices();
+      const devices = Array.isArray(value?.devices) ? value.devices : [];
+      status.setText(devices.length ? "These devices can currently access this account." : "No active devices are registered.");
+      for (const device of devices) {
+        if (!device || typeof device.name !== "string") continue;
+        const row = new Setting(el).setName(device.name).setDesc(device.name === this.plugin.settings.syncDeviceName ? `This device · ${formatLastSeen(device.lastSeenAt)}` : formatLastSeen(device.lastSeenAt));
+        row.addButton((button) => button.setButtonText("Revoke").setWarning().setDisabled(device.name === this.plugin.settings.syncDeviceName).onClick(async () => {
+          if (!window.confirm(`Revoke ${device.name}? Its access will stop immediately; account content is not deleted.`)) return;
+          try { await this.plugin.revokeActiveDevice(device.name); await this.refresh(); if (this.onChanged) await this.onChanged(); }
+          catch (error) { new Notice(error.message || String(error)); }
+        }));
+      }
+    } catch (error) { status.setText(error.message || "Could not load devices."); }
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
+function formatLastSeen(value) {
+  if (!Number.isInteger(value) || value <= 0) return "Last contact unavailable.";
+  return `Last online ${new Date(value * 1000).toLocaleString()}.`;
 }
 class ConflictModal extends Modal {
   constructor(app, plugin, issue, onDone) { super(app); this.plugin = plugin; this.issue = issue; this.onDone = onDone; }
