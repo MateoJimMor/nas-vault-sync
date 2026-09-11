@@ -3,9 +3,14 @@ import type { SyncEntry } from "./sync-reconcile";
 const KEY = "nas-vault-sync.v1.base";
 const PENDING_UPLOADS_KEY = "nas-vault-sync.v1.pending-uploads";
 const ISSUES_KEY = "nas-vault-sync.v1.issues";
+const TRANSACTION_KEY = "nas-vault-sync.v1.transaction";
+const CONFLICTS_KEY = "nas-vault-sync.v1.conflicts";
 export interface SyncState { entries: SyncEntry[]; revision: string; updatedAt: string }
 export interface PendingUpload { uploadId: string; path: string; sha256: string; size: number; ifMatch?: string; ifRevision?: string; ifNoneMatch?: true }
 export interface SyncIssue { id: string; kind: "conflict" | "sync-failed"; path?: string; conflictPath?: string; detail: string; createdAt: string; reviewed?: boolean; base?: unknown; local?: unknown; remote?: unknown }
+export interface SyncTransactionEntry { path: string; localSha256?: string; remoteSha256?: string; remoteRevision?: string; absent?: boolean }
+export interface SyncTransaction { baseRevision: string; completed: Record<string, SyncTransactionEntry>; updatedAt: string }
+export interface ConflictRecord { conflictPath: string; path: string; localSha256: string; baseRevision?: string; remoteRevision?: string; createdAt: string }
 
 /** State stays outside vault files and is scoped to one local vault installation. */
 function scoped(key: string, scope = "default"): string { return `${key}.${scope}`; }
@@ -16,6 +21,37 @@ export function saveSyncState(entries: readonly SyncEntry[], revision: string, s
   window.localStorage.setItem(scoped(KEY, scope), JSON.stringify({ entries, revision, updatedAt: new Date().toISOString() }));
 }
 export function clearSyncState(scope?: string): void { try { window.localStorage.removeItem(scoped(KEY, scope)); } catch { /* no local storage */ } }
+
+export function loadSyncTransaction(scope?: string): SyncTransaction | undefined {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(scoped(TRANSACTION_KEY, scope)) || "null");
+    if (!value || typeof value.baseRevision !== "string" || !value.completed || typeof value.completed !== "object") return undefined;
+    return value as SyncTransaction;
+  } catch { return undefined; }
+}
+export function saveSyncTransaction(value: SyncTransaction, scope?: string): void {
+  try { window.localStorage.setItem(scoped(TRANSACTION_KEY, scope), JSON.stringify(value)); } catch { /* no local storage */ }
+}
+export function clearSyncTransaction(scope?: string): void { try { window.localStorage.removeItem(scoped(TRANSACTION_KEY, scope)); } catch { /* no local storage */ } }
+
+function conflictRecords(scope?: string): Record<string, ConflictRecord> {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(scoped(CONFLICTS_KEY, scope)) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+export function loadConflictRecord(identity: string, scope?: string): ConflictRecord | undefined {
+  const value = conflictRecords(scope)[identity];
+  return value && typeof value.conflictPath === "string" ? value : undefined;
+}
+export function saveConflictRecord(identity: string, value: ConflictRecord, scope?: string): void {
+  try {
+    const records = conflictRecords(scope); records[identity] = value;
+    const keys = Object.keys(records);
+    for (const key of keys.slice(0, Math.max(0, keys.length - 500))) delete records[key];
+    window.localStorage.setItem(scoped(CONFLICTS_KEY, scope), JSON.stringify(records));
+  } catch { /* no local storage */ }
+}
 
 function pendingUploads(scope?: string): Record<string, PendingUpload> {
   try {

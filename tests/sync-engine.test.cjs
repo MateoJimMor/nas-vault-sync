@@ -207,3 +207,53 @@ test("normal sync resumes an interrupted chunk upload before committing", async 
   assert.deepEqual(cleared, ["note.md"]);
   assert.equal(committed, true);
 });
+
+test("normal sync does not replay paths completed before an interrupted run", async () => {
+  const oldA = { path: "a.md", sha256: "a".repeat(64), size: 3, modifiedAt: "2026-09-08T00:00:00Z", revision: "r-a" };
+  const oldB = { path: "b.md", sha256: "b".repeat(64), size: 3, modifiedAt: "2026-09-08T00:00:00Z", revision: "r-b" };
+  const newHash = createHash("sha256").update("new").digest("hex");
+  const newA = { ...oldA, sha256: newHash, revision: "r-a2" };
+  const newB = { ...oldB, sha256: newHash, revision: "r-b2" };
+  const files = new Map([["a.md", bytes("old")], ["b.md", bytes("old")]]);
+  let transaction;
+  let failB = true;
+  const downloads = [];
+  const require = name => ({
+    obsidian: { requestUrl: async () => ({}) },
+    "./sync-api": {
+      manifest: async () => ({ entries: [newA, newB], revision: "remote-revision" }),
+      pathUrl: path => path,
+      syncRequest: async (_requestUrl, _base, _token, path) => {
+        downloads.push(path);
+        if (path === "b.md" && failB) { failB = false; throw new Error("temporary download failure"); }
+        return { arrayBuffer: bytes(path === "a.md" ? "new" : "new") };
+      },
+    },
+    "./scope": { classifyVaultPath: () => ({ scope: "shared" }) },
+    "./sync-plan": { conflictPath: path => `${path}.conflict` },
+    "./sync-reconcile": { reconcile: () => [
+      { kind: "download", path: "a.md", remote: newA },
+      { kind: "download", path: "b.md", remote: newB },
+    ] },
+    "./sync-state": {
+      loadSyncState: () => ({ entries: [oldA, oldB], revision: "base-revision" }),
+      saveSyncState: () => {},
+      loadPendingUpload: () => undefined, savePendingUpload: () => {}, clearPendingUpload: () => {},
+      loadSyncTransaction: () => transaction,
+      saveSyncTransaction: value => { transaction = JSON.parse(JSON.stringify(value)); },
+      clearSyncTransaction: () => { transaction = undefined; },
+    },
+  })[name];
+  const context = { module: { exports: {} }, require, crypto: webcrypto, Uint8Array, Array, Date, Error, Map };
+  vm.runInNewContext(readFileSync(join(__dirname, "../src/sync-engine.js"), "utf8"), context);
+  const plugin = {
+    settings: { syncApiBaseUrl: "http://private", syncDeviceName: "device" }, getSyncToken: () => "test-token",
+    app: { vault: { adapter: { exists: async path => files.has(path), readBinary: async path => files.get(path), writeBinary: async (path, value) => files.set(path, value), remove: async path => files.delete(path) }, getFiles: () => [...files].map(([path]) => ({ path, stat: { mtime: 0 } })) } },
+  };
+  await assert.rejects(() => context.module.exports.syncNow(plugin), /temporary download failure/);
+  assert.deepEqual(downloads, ["a.md", "b.md"]);
+  const result = await context.module.exports.syncNow(plugin);
+  assert.equal(result.downloaded, 1);
+  assert.deepEqual(downloads, ["a.md", "b.md", "b.md"]);
+  assert.equal(transaction, undefined);
+});

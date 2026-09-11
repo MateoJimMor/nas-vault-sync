@@ -3,7 +3,7 @@ const { manifest, pathUrl, syncRequest, startUpload, uploadStatus, uploadChunk, 
 const { classifyVaultPath } = require("./scope");
 const { conflictPath, sourcePathForConflictCopy } = require("./sync-plan");
 const { reconcile } = require("./sync-reconcile");
-const { loadSyncState, saveSyncState, loadPendingUpload, savePendingUpload, clearPendingUpload, recordSyncResult, markSetupCopyRecovered } = require("./sync-state");
+const { loadSyncState, saveSyncState, loadPendingUpload, savePendingUpload, clearPendingUpload, recordSyncResult, markSetupCopyRecovered, loadSyncTransaction, saveSyncTransaction, clearSyncTransaction, loadConflictRecord, saveConflictRecord } = require("./sync-state");
 
 const FALLBACK_CHUNK_SIZE = 4 * 1024 * 1024;
 const syncBase = plugin => plugin.syncBaseUrl ? plugin.syncBaseUrl() : plugin.settings.syncApiBaseUrl;
@@ -35,13 +35,11 @@ async function ensureParentDirectory(plugin, path) {
   }
 }
 
-async function download(plugin, entry) {
+async function downloadBytes(plugin, entry) {
   const condition = { "If-Match": `"${entry.sha256}"` };
-  await ensureParentDirectory(plugin, entry.path);
   if (entry.size === 0) {
     const response = await syncRequest(requestUrl, syncBase(plugin), deviceCredential(plugin), pathUrl(entry.path), "GET", undefined, condition);
-    await plugin.app.vault.adapter.writeBinary(entry.path, response.arrayBuffer);
-    return;
+    return response.arrayBuffer;
   }
   const target = new Uint8Array(entry.size);
   for (let offset = 0; offset < entry.size; offset += FALLBACK_CHUNK_SIZE) {
@@ -52,16 +50,52 @@ async function download(plugin, entry) {
     target.set(chunk, offset);
   }
   if (await sha256(target.buffer) !== entry.sha256) throw new Error("Vault sync download did not match the server digest.");
-  await plugin.app.vault.adapter.writeBinary(entry.path, target.buffer);
+  return target.buffer;
 }
 
-async function preserveLocalConflict(plugin, path) {
+async function download(plugin, entry) {
+  const bytes = await downloadBytes(plugin, entry);
+  await ensureParentDirectory(plugin, entry.path);
+  await plugin.app.vault.adapter.writeBinary(entry.path, bytes);
+}
+
+async function preserveLocalConflict(plugin, path, identity = {}) {
   const adapter = plugin.app.vault.adapter;
   if (!await adapter.exists(path)) return undefined;
+  const localBytes = await adapter.readBinary(path);
+  const localSha256 = identity.localSha256 || await sha256(localBytes);
+  const key = [path, localSha256, identity.baseRevision || "", identity.remoteRevision || identity.remoteSha256 || ""].join("|");
+  const previous = typeof loadConflictRecord === "function" ? loadConflictRecord(key, stateScope(plugin)) : undefined;
+  if (previous?.conflictPath && await adapter.exists(previous.conflictPath)) return previous.conflictPath;
   const conflict = conflictPath(path, plugin.settings.syncDeviceName || "device", new Date().toISOString());
   await ensureParentDirectory(plugin, conflict);
-  await adapter.writeBinary(conflict, await adapter.readBinary(path));
+  await adapter.writeBinary(conflict, localBytes);
+  if (typeof saveConflictRecord === "function") saveConflictRecord(key, { conflictPath: conflict, path, localSha256, baseRevision: identity.baseRevision, remoteRevision: identity.remoteRevision, createdAt: new Date().toISOString() }, stateScope(plugin));
   return conflict;
+}
+
+function completionFor(action) {
+  if (action.kind === "delete-local" || action.kind === "delete-remote") return { absent: true };
+  if (action.kind === "conflict") return { localSha256: action.remote?.sha256, remoteSha256: action.remote?.sha256, remoteRevision: action.remote?.revision };
+  if (action.kind === "download") return { localSha256: action.remote?.sha256, remoteSha256: action.remote?.sha256, remoteRevision: action.remote?.revision };
+  if (action.kind === "upload") return { localSha256: action.local?.sha256, remoteSha256: action.local?.sha256 };
+  return {};
+}
+
+function completionStillValid(action, completion, localByPath, remoteByPath) {
+  if (!completion) return false;
+  if (completion.absent) return !localByPath.has(action.path) && !remoteByPath.has(action.path);
+  const local = localByPath.get(action.path), remote = remoteByPath.get(action.path);
+  return Boolean(local && remote)
+    && (!completion.localSha256 || local.sha256 === completion.localSha256)
+    && (!completion.remoteSha256 || remote.sha256 === completion.remoteSha256)
+    && (!completion.remoteRevision || remote.revision === completion.remoteRevision);
+}
+
+function recordCompletion(transaction, action) {
+  transaction.completed[action.path] = completionFor(action);
+  transaction.updatedAt = new Date().toISOString();
+  return transaction;
 }
 
 function sameUpload(pending, local, remote) {
@@ -103,8 +137,12 @@ async function initialServerSync(plugin) {
   const remotePaths = new Set(remote.entries.map(entry => entry.path));
   for (const entry of remote.entries) {
     if (classifyVaultPath(entry.path).scope !== "shared") { result.skipped++; continue; }
-    if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) !== entry.sha256) { const conflict = await preserveLocalConflict(plugin, entry.path); if (conflict) conflictPaths.push(conflict); result.conflicts++; }
-    await download(plugin, entry); result.downloaded++;
+    if (await adapter.exists(entry.path) && await sha256(await adapter.readBinary(entry.path)) !== entry.sha256) {
+      const bytes = await downloadBytes(plugin, entry);
+      const conflict = await preserveLocalConflict(plugin, entry.path, { remoteSha256: entry.sha256, remoteRevision: entry.revision, baseRevision: remote.revision });
+      if (conflict) conflictPaths.push(conflict); await adapter.writeBinary(entry.path, bytes); result.conflicts++;
+    } else await download(plugin, entry);
+    result.downloaded++;
   }
   for (const entry of await localManifest(plugin)) {
     if (remotePaths.has(entry.path)) continue;
@@ -175,20 +213,35 @@ async function syncNow(plugin) {
   const remote = await manifest(requestUrl, syncBase(plugin), deviceCredential(plugin));
   const local = await localManifest(plugin);
   const result = { downloaded: 0, uploaded: 0, deleted: 0, conflicts: 0, skipped: 0 }, conflictPaths = [], conflictDetails = [];
+  const localByPath = new Map(local.map(item => [item.path, item]));
+  const remoteByPath = new Map(remote.entries.map(item => [item.path, item]));
+  const existing = typeof loadSyncTransaction === "function" ? loadSyncTransaction(stateScope(plugin)) : undefined;
+  const transaction = existing && existing.baseRevision === state.revision ? existing : { baseRevision: state.revision, completed: {}, updatedAt: new Date().toISOString() };
   for (const action of reconcile(state.entries, local, remote.entries)) {
     if (action.kind === "none") continue;
     if (classifyVaultPath(action.path).scope !== "shared") { result.skipped++; continue; }
-    if (action.kind === "download") { await download(plugin, action.remote); result.downloaded++; continue; }
-    if (action.kind === "delete-local") { await plugin.app.vault.adapter.remove(action.path); result.deleted++; continue; }
+    if (completionStillValid(action, transaction.completed[action.path], localByPath, remoteByPath)) continue;
+    if (action.kind === "download") { await download(plugin, action.remote); result.downloaded++; recordCompletion(transaction, action); if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin)); continue; }
+    if (action.kind === "delete-local") { await plugin.app.vault.adapter.remove(action.path); result.deleted++; recordCompletion(transaction, action); if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin)); continue; }
     if (action.kind === "upload") {
-      await resumableUpload(plugin, action.local, action.remote); result.uploaded++; continue;
+      await resumableUpload(plugin, action.local, action.remote); result.uploaded++; recordCompletion(transaction, action); if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin)); continue;
     }
-    if (action.kind === "delete-remote") { await syncRequest(requestUrl, syncBase(plugin), deviceCredential(plugin), pathUrl(action.path), "DELETE", undefined, { "If-Match": `"${action.remote.sha256}"`, ...(action.remote.revision ? { "X-NAS-Revision": action.remote.revision } : {}) }); result.deleted++; continue; }
-    const conflict = await preserveLocalConflict(plugin, action.path); if (conflict) conflictPaths.push(conflict); conflictDetails.push({ path: action.path, conflictPath: conflict, base: action.base, local: action.local, remote: action.remote }); result.conflicts++;
-    if (action.remote) { await download(plugin, action.remote); result.downloaded++; } else await plugin.app.vault.adapter.remove(action.path);
+    if (action.kind === "delete-remote") { await syncRequest(requestUrl, syncBase(plugin), deviceCredential(plugin), pathUrl(action.path), "DELETE", undefined, { "If-Match": `"${action.remote.sha256}"`, ...(action.remote.revision ? { "X-NAS-Revision": action.remote.revision } : {}) }); result.deleted++; recordCompletion(transaction, action); if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin)); continue; }
+    if (action.remote) {
+      const bytes = await downloadBytes(plugin, action.remote);
+      const conflict = await preserveLocalConflict(plugin, action.path, { localSha256: action.local?.sha256, remoteSha256: action.remote.sha256, remoteRevision: action.remote.revision, baseRevision: action.base?.revision || state.revision });
+      if (conflict) conflictPaths.push(conflict); conflictDetails.push({ path: action.path, conflictPath: conflict, base: action.base, local: action.local, remote: action.remote });
+      await ensureParentDirectory(plugin, action.path); await plugin.app.vault.adapter.writeBinary(action.path, bytes); result.downloaded++; result.conflicts++;
+    } else {
+      const conflict = await preserveLocalConflict(plugin, action.path, { localSha256: action.local?.sha256, baseRevision: action.base?.revision || state.revision });
+      if (conflict) conflictPaths.push(conflict); conflictDetails.push({ path: action.path, conflictPath: conflict, base: action.base, local: action.local, remote: action.remote });
+      await plugin.app.vault.adapter.remove(action.path); result.conflicts++;
+    }
+    recordCompletion(transaction, action); if (typeof saveSyncTransaction === "function") saveSyncTransaction(transaction, stateScope(plugin));
   }
   const completed = await manifest(requestUrl, syncBase(plugin), deviceCredential(plugin));
   saveSyncState(completed.entries, completed.revision, stateScope(plugin));
+  if (typeof clearSyncTransaction === "function") clearSyncTransaction(stateScope(plugin));
   if (typeof recordSyncResult === "function") recordSyncResult({ ...result, conflictPaths, conflictDetails }, stateScope(plugin)); return result;
 }
 

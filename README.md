@@ -8,8 +8,8 @@ server-routed daily-note workflow, and an optional private vault-sync client.
 
 ## Current release
 
-Version 0.6.2 is a privacy-cleanup release built on the 0.6.1 unified
-NAS-base-URL architecture. The plugin requires a compatible
+Version 0.6.3 is a sync-integrity release built on the 0.6.2 privacy-cleanup
+release and the 0.6.1 unified NAS-base-URL architecture. The plugin requires a compatible
 self-hosted NAS API and private network; this repository contains the Obsidian
 client only. The server, enrollment service, VPN, and hosting infrastructure
 are separate components.
